@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}Stylia ↔ Shopify Sync{% endblock %}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+  </head>
+  <body class="bg-gray-50 text-gray-900">
+    <nav class="bg-white shadow mb-6">
+      <div class="max-w-7xl mx-auto px-4 py-4 flex items-center justify-between">
+        <h1 class="text-xl font-bold">Stylia ↔ Shopify Sync</h1>
+        <div class="space-x-3">
+          <a href="/" class="text-sm text-blue-700 hover:underline">Dashboard</a>
+          <a href="/admin/" class="text-sm text-gray-700 hover:underline">Admin</a>
+        </div>
+      </div>
+    </nav>
+    <main class="max-w-7xl mx-auto px-4">
+      {% block content %}{% endblock %}
+    </main>
+  </body>
+  </html>

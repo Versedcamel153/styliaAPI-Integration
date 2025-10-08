@@ -1,0 +1,145 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard · Stylia ↔ Shopify Sync{% endblock %}
+
+{% block content %}
+<div class="mb-6 flex flex-wrap items-center justify-between gap-4">
+    <div class="grid grid-cols-2 md:grid-cols-5 gap-3">
+        <div class="bg-white p-4 rounded shadow">
+            <div class="text-gray-500 text-sm">Total</div>
+            <div class="text-2xl font-semibold">{{ stats.total }}</div>
+        </div>
+        <div class="bg-white p-4 rounded shadow">
+            <div class="text-gray-500 text-sm">Pushed</div>
+            <div class="text-2xl font-semibold text-green-600">{{ stats.pushed }}</div>
+        </div>
+        <div class="bg-white p-4 rounded shadow">
+            <div class="text-gray-500 text-sm">Pending</div>
+            <div class="text-2xl font-semibold text-blue-600">{{ stats.pending }}</div>
+        </div>
+        <div class="bg-white p-4 rounded shadow">
+            <div class="text-gray-500 text-sm">Failed</div>
+            <div class="text-2xl font-semibold text-red-600">{{ stats.failed }}</div>
+        </div>
+        <!-- <div class="bg-white p-4 rounded shadow">
+            <div class="text-gray-500 text-sm">Deleted</div>
+            <div class="text-2xl font-semibold text-gray-600">{{ stats.deleted }}</div>
+        </div> -->
+    </div>
+
+    <div class="flex items-center gap-2">
+        <label for="show" class="text-sm text-gray-700">Show:</label>
+        <select id="show" onchange="onFilterChange()"
+            class="border select border-gray-300 rounded px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+            <option value="all" {% if show == 'all' %}selected{% endif %}>All</option>
+            <option value="pushed" {% if show == 'pushed' %}selected{% endif %}>Pushed</option>
+            <option value="pending" {% if show == 'pending' %}selected{% endif %}>Pending</option>
+            <option value="failed" {% if show == 'failed' %}selected{% endif %}>Failed</option>
+            <option value="deleted" {% if show == 'deleted' %}selected{% endif %}>Deleted</option>
+        </select>
+        <button onclick="triggerSync()" class="bg-blue-600 hover:bg-blue-700 text-white rounded px-4 py-2">Run Sync Now</button>
+    </div>
+</div>
+
+<div class="bg-white rounded shadow overflow-hidden mb-20">
+    <table class="min-w-full divide-y divide-gray-200">
+        <thead class="bg-gray-50">
+            <tr>
+                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500"></th>
+                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500">Model</th>
+                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500">Brand</th>
+                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500">Title</th>
+                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500">Status</th>
+                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500">Stock</th>
+                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500">Shopify Link</th>
+                <th class="px-4 py-2"></th>
+            </tr>
+        </thead>
+        <tbody class="bg-white divide-y divide-gray-200">
+            {% for p in products %}
+            <tr class="hover:bg-gray-50">
+                <td class="px-4 py-2">{{ forloop.counter0|add:products.start_index }}</td>
+                <td class="px-4 py-2 font-mono text-sm">{{ p.model_code }}</td>
+                <td class="px-4 py-2">{{ p.brand }}</td>
+                <td class="px-4 py-2">{{ p.title|default:'—' }}</td>
+                <td class="px-4 py-2"><span class="inline-block px-2 py-1 text-xs rounded {% if p.sync_status == 'active' %}bg-green-400 {% elif p.sync_status == 'pending' %}bg-orange-400 {% else %} bg-red-400 {% endif %} text-white">{{ p.sync_status }}</span></td>
+                <td class="px-4 py-2">{{ p.total_stock }}</td>
+                <td class="px-4 py-2">
+                    {% if p.shopify_id %}
+                    <a class="text-blue-600 hover:underline" target="_blank"
+                        href="https://{{ shopify_store_url }}/admin/products/{{ p.shopify_id }}">{{p.shopify_handle|default:p.shopify_id }}</a>
+                    {% else %}
+                    <span class="text-gray-400">—</span>
+                    {% endif %}
+                </td>
+                <td class="px-4 py-2 text-right">
+                    {% if p.sync_status == 'deleted' or p.sync_status == 'failed' %}
+                    <button onclick="reenable('{{ p.id }}')"
+                        class="text-sm bg-green-600 hover:bg-green-700 text-white rounded px-3 py-1">Re-enable</button>
+                    {% endif %}
+                </td>
+            </tr>
+            {% empty %}
+            <tr>
+                <td class="px-4 py-6 text-center text-gray-500" colspan="7">No products found</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+    <div class="px-4 py-3">
+        <div class="flex items-center justify-between">
+            <div class="text-sm text-gray-500">Page {{ products.number }} of {{ products.paginator.num_pages }}</div>
+            <div class="space-x-2">
+                {% if products.has_previous %}
+                <a class="px-3 bg-blue-600 hover:bg-blue-700 text-white py-1 border rounded"
+                    href="?show={{ show }}&page={{ products.previous_page_number }}">Prev</a>
+                {% endif %}
+                {% if products.has_next %}
+                <a class="px-3 bg-blue-600 hover:bg-blue-700 text-white py-1 border rounded"
+                    href="?show={{ show }}&page={{ products.next_page_number }}">Next</a>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    function onFilterChange() {
+        const show = document.getElementById('show').value;
+        const url = new URL(window.location.href);
+        url.searchParams.set('show', show);
+        url.searchParams.delete('page');
+        window.location.href = url.toString();
+    }
+
+    async function triggerSync() {
+        try {
+            const res = await fetch('/api/trigger-sync/', { method: 'POST' });
+            const data = await res.json();
+            alert(data.success ? 'Sync queued: ' + data.task_id : 'Failed: ' + data.error);
+        } catch (e) {
+            alert('Request failed: ' + e.message);
+        }
+    }
+
+    async function reenable(id) {
+        if (!confirm('Re-enable this product for syncing?')) return;
+        const pushNow = confirm('Do you also want to trigger an immediate sync now?');
+        try {
+            const res = await fetch(`/api/products/${id}/reenable/${pushNow ? '?push=1' : ''}`, { method: 'POST' });
+            const data = await res.json();
+            if (data.success) {
+                if (data.pushed_immediately) {
+                    alert('Product re-enabled and a sync has been queued (task: ' + data.task_id + ').');
+                }
+                window.location.reload();
+            } else {
+                alert('Failed: ' + data.error)
+            }
+        } catch (e) {
+            alert('Request failed: ' + e.message);
+        }
+    }
+</script>
+{% endblock %}
