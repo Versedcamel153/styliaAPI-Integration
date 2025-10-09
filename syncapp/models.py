@@ -31,6 +31,9 @@ class StyliaProduct(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     last_synced_at = models.DateTimeField(default=timezone.now)
+    # Inventory location tracking
+    location_assigned = models.BooleanField(default=False)
+    location_last_error = models.TextField(blank=True)
 
     def mark_as_synced(self):
         self.sync_status = "active"

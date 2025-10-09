@@ -37,7 +37,8 @@
             <option value="failed" {% if show == 'failed' %}selected{% endif %}>Failed</option>
             <option value="deleted" {% if show == 'deleted' %}selected{% endif %}>Deleted</option>
         </select>
-        <button onclick="triggerSync()" class="bg-blue-600 hover:bg-blue-700 text-white rounded px-4 py-2">Run Sync Now</button>
+        <button onclick="triggerSync()" class="bg-blue-600 hover:bg-blue-700 text-white rounded px-4 py-2">Run Sync
+            Now</button>
     </div>
 </div>
 
@@ -52,6 +53,7 @@
                 <th class="px-4 py-2 text-left text-xs font-medium text-gray-500">Status</th>
                 <th class="px-4 py-2 text-left text-xs font-medium text-gray-500">Stock</th>
                 <th class="px-4 py-2 text-left text-xs font-medium text-gray-500">Shopify Link</th>
+                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500">Location</th>
                 <th class="px-4 py-2"></th>
             </tr>
         </thead>
@@ -62,14 +64,27 @@
                 <td class="px-4 py-2 font-mono text-sm">{{ p.model_code }}</td>
                 <td class="px-4 py-2">{{ p.brand }}</td>
                 <td class="px-4 py-2">{{ p.title|default:'—' }}</td>
-                <td class="px-4 py-2"><span class="inline-block px-2 py-1 text-xs rounded {% if p.sync_status == 'active' %}bg-green-400 {% elif p.sync_status == 'pending' %}bg-orange-400 {% else %} bg-red-400 {% endif %} text-white">{{ p.sync_status }}</span></td>
+                <td class="px-4 py-2"><span
+                        class="inline-block px-2 py-1 text-xs rounded {% if p.sync_status == 'active' %}bg-green-400 {% elif p.sync_status == 'pending' %}bg-orange-400 {% else %} bg-red-400 {% endif %} text-white">{{
+                        p.sync_status }}</span></td>
                 <td class="px-4 py-2">{{ p.total_stock }}</td>
                 <td class="px-4 py-2">
                     {% if p.shopify_id %}
                     <a class="text-blue-600 hover:underline" target="_blank"
-                        href="https://{{ shopify_store_url }}/admin/products/{{ p.shopify_id }}">{{p.shopify_handle|default:p.shopify_id }}</a>
+                        href="https://{{ shopify_store_url }}/admin/products/{{ p.shopify_id }}">{{p.shopify_handle|default:p.shopify_id
+                        }}</a>
                     {% else %}
                     <span class="text-gray-400">—</span>
+                    {% endif %}
+                </td>
+                <td class="px-4 py-2">
+                    {% if p.location_assigned %}
+                    <span class="text-green-700 text-xs bg-green-100 px-2 py-1 rounded">Assigned</span>
+                    {% elif p.location_last_error %}
+                    <span class="text-red-700 text-xs bg-red-100 px-2 py-1 rounded"
+                        title="{{ p.location_last_error }}">Error</span>
+                    {% else %}
+                    <span class="text-gray-500 text-xs bg-gray-100 px-2 py-1 rounded">Pending</span>
                     {% endif %}
                 </td>
                 <td class="px-4 py-2 text-right">

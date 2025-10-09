@@ -79,3 +79,8 @@ STYLIA_BASE_URL = os.environ.get("STYLIA_BASE_URL")
 
 SHOPIFY_STORE_URL = os.environ.get("SHOPIFY_STORE_URL")
 SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN")
+
+# Shopify Location configuration (inventory levels)
+# If SHOPIFY_LOCATION_ID is not provided, code may resolve by name at runtime.
+SHOPIFY_LOCATION_ID = os.environ.get("SHOPIFY_LOCATION_ID", 112990716244)
+SHOPIFY_LOCATION_NAME = os.environ.get("SHOPIFY_LOCATION_NAME", "Stylia Warehouse")

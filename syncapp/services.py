@@ -2,6 +2,9 @@ import json
 import hashlib
 import requests
 from django.conf import settings
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def get_stylia_sync_list():
@@ -130,6 +133,55 @@ def shopify_update(product_id, product_payload):
     return r.json()
 
 
+def shopify_get_locations():
+    url = f"https://{settings.SHOPIFY_STORE_URL}/admin/api/2025-07/locations.json"
+    r = requests.get(url, headers=shopify_headers(), timeout=20)
+    r.raise_for_status()
+    return r.json().get("locations", [])
+
+
+def resolve_location_id():
+    # Prefer explicit ID if provided
+    if getattr(settings, "SHOPIFY_LOCATION_ID", ""):
+        return settings.SHOPIFY_LOCATION_ID
+    # Otherwise try to resolve by name
+    name = getattr(settings, "SHOPIFY_LOCATION_NAME", "Stylia Warehouse")
+    try:
+        for loc in shopify_get_locations():
+            if loc.get("name") == name:
+                return str(loc.get("id"))
+    except Exception as e:
+        logger.warning("Failed to resolve Shopify location by name: %s", e)
+    return ""
+
+
+def inventory_connect(inventory_item_id: int, location_id: str):
+    url = f"https://{settings.SHOPIFY_STORE_URL}/admin/api/2025-07/inventory_levels/connect.json"
+    payload = {
+        "inventory_item_id": int(inventory_item_id),
+        "location_id": int(location_id),
+    }
+    r = requests.post(url, headers=shopify_headers(), json=payload, timeout=20)
+    # 200 OK on success, 422 if already connected (we treat as ok)
+    if r.status_code not in (200, 201, 202, 204):
+        # many 422s are benign; log and continue
+        logger.info("inventory_connect returned %s: %s", r.status_code, r.text[:500])
+    return r
+
+
+def inventory_set(inventory_item_id: int, location_id: str, available: int):
+    url = f"https://{settings.SHOPIFY_STORE_URL}/admin/api/2025-07/inventory_levels/set.json"
+    payload = {
+        "inventory_item_id": int(inventory_item_id),
+        "location_id": int(location_id),
+        "available": int(max(0, available or 0)),
+    }
+    r = requests.post(url, headers=shopify_headers(), json=payload, timeout=20)
+    if r.status_code not in (200, 201):
+        logger.warning("inventory_set failed %s: %s", r.status_code, r.text[:500])
+    return r
+
+
 def reconcile_shopify_state():
     from .models import StyliaProduct
 
@@ -241,16 +293,24 @@ def push_to_shopify():
     qs = StyliaProduct.objects.filter(sync_status="pending")
     created = updated = errors = 0
 
+    location_id_cache = resolve_location_id()
     for p in qs.iterator():
         try:
             if not p.shopify_id:
                 created_payload = shopify_create(p.shopify_data)
                 p.shopify_id = created_payload["product"]["id"]
                 p.shopify_handle = created_payload["product"]["handle"]
+                # After create, try to set inventory at location
+                _assign_inventory_to_location(
+                    created_payload["product"], location_id_cache, p
+                )
                 p.mark_as_synced()
                 created += 1
             else:
-                shopify_update(p.shopify_id, p.shopify_data)
+                updated_payload = shopify_update(p.shopify_id, p.shopify_data)
+                _assign_inventory_to_location(
+                    updated_payload.get("product"), location_id_cache, p
+                )
                 p.mark_as_synced()
                 updated += 1
         except Exception:
@@ -261,3 +321,40 @@ def push_to_shopify():
         "success": True,
         "summary": {"created": created, "updated": updated, "errors": errors},
     }
+
+
+def _assign_inventory_to_location(product_json, location_id, db_obj):
+    """Best-effort inventory assignment to a location per variant.
+    Does not raise; logs and updates model flags.
+    """
+    from .models import StyliaProduct
+
+    if not product_json:
+        return
+    if not location_id:
+        logger.info(
+            "No Shopify location configured; skipping inventory levels assignment"
+        )
+        return
+    try:
+        variants = product_json.get("variants", [])
+        # If no variants, nothing to set
+        for v in variants:
+            inv_item_id = v.get("inventory_item_id")
+            qty = v.get("inventory_quantity", 0)
+            # ensure inventory is Shopify-managed
+            # v["inventory_management"] is set in payload; Shopify should reflect it
+            inventory_connect(inv_item_id, location_id)
+            inventory_set(inv_item_id, location_id, qty)
+        db_obj.location_assigned = True
+        db_obj.location_last_error = ""
+        db_obj.save(update_fields=["location_assigned", "location_last_error"])
+    except Exception as e:
+        logger.exception(
+            "Failed assigning inventory to location for product %s: %s",
+            db_obj.model_code,
+            e,
+        )
+        db_obj.location_assigned = False
+        db_obj.location_last_error = str(e)[:1000]
+        db_obj.save(update_fields=["location_assigned", "location_last_error"])
