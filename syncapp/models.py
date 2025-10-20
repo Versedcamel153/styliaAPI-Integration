@@ -34,14 +34,25 @@ class StyliaProduct(models.Model):
     # Inventory location tracking
     location_assigned = models.BooleanField(default=False)
     location_last_error = models.TextField(blank=True)
+    # Push error tracking
+    push_last_error = models.TextField(blank=True)
+    push_error_count = models.IntegerField(default=0)
 
     def mark_as_synced(self):
         self.sync_status = "active"
         self.last_synced_at = timezone.now()
+        # clear push error info on success
+        self.push_last_error = ""
+        self.push_error_count = 0
         self.save()
 
-    def mark_as_failed(self):
+    def mark_as_failed(self, message=None):
         self.sync_status = "failed"
+        if message:
+            self.push_last_error = str(message)[:2000]
+            self.push_error_count = (self.push_error_count or 0) + 1
+        else:
+            self.push_error_count = (self.push_error_count or 0) + 1
         self.save()
 
     def mark_as_deleted(self):
@@ -66,3 +77,19 @@ class SyncLog(models.Model):
         if error_message:
             self.error_message = error_message
         self.save()
+
+
+class ShopifyApp(models.Model):
+    """Persist installed shop and admin access token for API calls."""
+
+    shop_domain = models.CharField(
+        max_length=255,
+        unique=True,
+        help_text="Shopify shop domain, e.g. example-store.myshopify.com",
+    )
+    access_token = models.CharField(max_length=255, help_text="Admin API access token")
+    scopes = models.CharField(max_length=512, blank=True)
+    installed_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.shop_domain}"

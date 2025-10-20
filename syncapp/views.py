@@ -6,6 +6,11 @@ from .models import StyliaProduct
 from .tasks import run_full_sync
 import json
 from django.conf import settings
+from django.shortcuts import redirect
+from django.urls import reverse
+from .models import ShopifyApp
+import requests
+from django.utils import timezone
 
 
 def dashboard(request):
@@ -78,3 +83,72 @@ def api_reenable_product(request, pk):
         except Exception as e:
             return JsonResponse({"success": False, "error": str(e)}, status=500)
     return JsonResponse({"success": True, "pushed_immediately": False})
+
+
+def shopify_install(request):
+    """Redirect merchant to Shopify OAuth grant page."""
+    shop = request.GET.get("shop") or settings.SHOPIFY_STORE_URL
+    if not shop:
+        return JsonResponse(
+            {"success": False, "error": "shop parameter required"}, status=400
+        )
+
+    api_key = getattr(settings, "SHOPIFY_API_KEY", None)
+    redirect_uri = getattr(settings, "APP_BASE_URL", "http://localhost:8000") + reverse(
+        "shopify_callback"
+    )
+    scopes = getattr(
+        settings,
+        "SHOPIFY_OAUTH_SCOPES",
+        "write_products,write_inventory,read_products,read_locations",
+    )
+
+    # Build install URL
+    install_url = f"https://{shop}/admin/oauth/authorize?client_id={api_key}&scope={scopes}&redirect_uri={redirect_uri}"
+    return redirect(install_url)
+
+
+def shopify_callback(request):
+    """Exchange code for access token and persist it."""
+    code = request.GET.get("code")
+    shop = request.GET.get("shop")
+    if not code or not shop:
+        return JsonResponse(
+            {"success": False, "error": "missing code/shop"}, status=400
+        )
+
+    token_url = f"https://{shop}/admin/oauth/access_token"
+    data = {
+        "client_id": settings.SHOPIFY_API_KEY,
+        "client_secret": settings.SHOPIFY_API_SECRET,
+        "code": code,
+    }
+    r = requests.post(token_url, json=data, timeout=20)
+    if r.status_code != 200:
+        return JsonResponse(
+            {
+                "success": False,
+                "error": f"token exchange failed: {r.status_code} - {r.text}",
+            },
+            status=500,
+        )
+
+    payload = r.json()
+    access_token = payload.get("access_token")
+    scopes = payload.get("scope") or ""
+    if not access_token:
+        return JsonResponse(
+            {"success": False, "error": "no access_token returned"}, status=500
+        )
+
+    obj, created = ShopifyApp.objects.update_or_create(
+        shop_domain=shop,
+        defaults={
+            "access_token": access_token,
+            "scopes": scopes,
+            "installed_at": timezone.now(),
+        },
+    )
+
+    # Redirect to dashboard with a simple success message
+    return redirect(reverse("sync_dashboard") + "?installed=1")

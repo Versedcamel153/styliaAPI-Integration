@@ -9,4 +9,6 @@ urlpatterns = [
         views.api_reenable_product,
         name="api_reenable_product",
     ),
+    path("shopify/install/", views.shopify_install, name="shopify_install"),
+    path("shopify/callback/", views.shopify_callback, name="shopify_callback"),
 ]

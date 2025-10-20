@@ -84,3 +84,15 @@ SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN")
 # If SHOPIFY_LOCATION_ID is not provided, code may resolve by name at runtime.
 SHOPIFY_LOCATION_ID = os.environ.get("SHOPIFY_LOCATION_ID", 112990716244)
 SHOPIFY_LOCATION_NAME = os.environ.get("SHOPIFY_LOCATION_NAME", "Stylia Warehouse")
+print(SHOPIFY_ACCESS_TOKEN)
+
+# OAuth / App settings (for automatic token fetch)
+SHOPIFY_API_KEY = os.environ.get("SHOPIFY_API_KEY")
+SHOPIFY_API_SECRET = os.environ.get("SHOPIFY_API_SECRET")
+# comma-separated scopes to request during install
+SHOPIFY_OAUTH_SCOPES = os.environ.get(
+    "SHOPIFY_OAUTH_SCOPES",
+    "write_products,write_inventory,read_products,read_locations",
+)
+# Base URL for the app; used to build the OAuth redirect URI
+APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://localhost:8000")

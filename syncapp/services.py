@@ -3,12 +3,21 @@ import hashlib
 import requests
 from django.conf import settings
 import logging
+import traceback
 
 logger = logging.getLogger(__name__)
 
 
 def get_stylia_sync_list():
-    url = f"{settings.STYLIA_BASE_URL}/sync/getItemsList"
+    base = getattr(settings, "STYLIA_BASE_URL", None)
+    if not base:
+        raise RuntimeError(
+            "STYLIA_BASE_URL is not set in settings. Set the env var STYLIA_BASE_URL to the Stylia API base URL."
+        )
+    if not base.startswith("http://") and not base.startswith("https://"):
+        raise RuntimeError(f"STYLIA_BASE_URL does not look like a URL: {base}")
+
+    url = f"{base.rstrip('/')}/sync/getItemsList"
     r = requests.get(
         url, auth=(settings.STYLIA_USERNAME, settings.STYLIA_PASSWORD), timeout=30
     )
@@ -20,12 +29,21 @@ def get_stylia_sync_list():
 
 
 def generate_hash(product):
+    # include per-item identifying fields (sku/ean/price/stock) to detect variant-level changes
+    items = product.get("items", []) or []
+    item_signatures = []
+    for it in items:
+        p = it.get("sellingPrice") or it.get("price") or 0
+        sku = it.get("sku") or it.get("ean") or ""
+        stk = it.get("stock") or 0
+        item_signatures.append(f"{sku}:{p}:{stk}")
+
     key = {
         "brand": product.get("brand", ""),
         "modelCode": product.get("modelCode", ""),
         "stock": product.get("stock", 0),
-        "price": product.get("sellingPrice", 0),
-        "items_count": len(product.get("items", [])),
+        "items": sorted(item_signatures),
+        "items_count": len(items),
     }
     return hashlib.md5(json.dumps(key, sort_keys=True).encode()).hexdigest()
 
@@ -38,8 +56,16 @@ def map_to_shopify(stylia_group):
 
     variants = []
     for item in stylia_group.get("items", []):
+        # prefer item-level sellingPrice if present, then item.price, then group-level sellingPrice/price
+        price_val = (
+            item.get("sellingPrice")
+            or item.get("price")
+            or stylia_group.get("sellingPrice")
+            or stylia_group.get("price")
+            or 0
+        )
         v = {
-            "price": str(stylia_group.get("sellingPrice", item.get("price", 0))),
+            "price": str(price_val),
             "compare_at_price": str(stylia_group.get("retailPrice", 0)),
             "inventory_quantity": item.get("stock", 0),
             "sku": item.get("sku", ""),
@@ -106,10 +132,21 @@ def map_to_shopify(stylia_group):
 
 
 def shopify_headers():
-    return {
-        "X-Shopify-Access-Token": settings.SHOPIFY_ACCESS_TOKEN,
-        "Content-Type": "application/json",
-    }
+    token = settings.SHOPIFY_ACCESS_TOKEN
+    # prefer a saved token from the DB if present
+    try:
+        from .models import ShopifyApp
+
+        shop_domain = settings.SHOPIFY_STORE_URL
+        if shop_domain:
+            app = ShopifyApp.objects.filter(shop_domain=shop_domain).first()
+            if app and app.access_token:
+                token = app.access_token
+    except Exception:
+        # don't fail hard if DB isn't available during migration/setup
+        pass
+
+    return {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
 
 
 def shopify_get_product(product_id):
@@ -121,7 +158,20 @@ def shopify_create(product_payload):
     url = f"https://{settings.SHOPIFY_STORE_URL}/admin/api/2025-07/products.json"
     r = requests.post(url, headers=shopify_headers(), json=product_payload, timeout=30)
     if r.status_code not in (200, 201):
-        raise RuntimeError(f"Shopify create failed: {r.status_code} - {r.text}")
+        hint = ""
+        try:
+            text = r.text or ""
+            if r.status_code == 403 and (
+                "write_products" in text or "requires merchant approval" in text
+            ):
+                hint = (
+                    "\nHINT: Shopify returned 403 - the API token lacks required Admin API scopes.\n"
+                    "Ensure your app access token includes 'write_products' (and 'write_inventory' if you need inventory updates),\n"
+                    "then reinstall or regenerate the token and set SHOPIFY_ACCESS_TOKEN accordingly."
+                )
+        except Exception:
+            hint = ""
+        raise RuntimeError(f"Shopify create failed: {r.status_code} - {r.text}{hint}")
     return r.json()
 
 
@@ -129,7 +179,20 @@ def shopify_update(product_id, product_payload):
     url = f"https://{settings.SHOPIFY_STORE_URL}/admin/api/2025-07/products/{product_id}.json"
     r = requests.put(url, headers=shopify_headers(), json=product_payload, timeout=30)
     if r.status_code != 200:
-        raise RuntimeError(f"Shopify update failed: {r.status_code} - {r.text}")
+        hint = ""
+        try:
+            text = r.text or ""
+            if r.status_code == 403 and (
+                "write_products" in text or "requires merchant approval" in text
+            ):
+                hint = (
+                    "\nHINT: Shopify returned 403 - the API token lacks required Admin API scopes.\n"
+                    "Ensure your app access token includes 'write_products' (and 'write_inventory' if you need inventory updates),\n"
+                    "then reinstall or regenerate the token and set SHOPIFY_ACCESS_TOKEN accordingly."
+                )
+        except Exception:
+            hint = ""
+        raise RuntimeError(f"Shopify update failed: {r.status_code} - {r.text}{hint}")
     return r.json()
 
 
@@ -313,8 +376,19 @@ def push_to_shopify():
                 )
                 p.mark_as_synced()
                 updated += 1
-        except Exception:
-            p.mark_as_failed()
+        except Exception as exc:
+            # capture full traceback and a short message to persist on the model
+            tb = traceback.format_exc()
+            logger.exception(
+                "Failed pushing product %s to Shopify: %s", p.model_code, tb
+            )
+            # persist a truncated message to avoid extremely large DB fields
+            short = tb[:2000]
+            try:
+                p.mark_as_failed(message=short)
+            except Exception:
+                # ensure we don't raise while handling an error; log and continue
+                logger.exception("Failed to mark product %s as failed", p.model_code)
             errors += 1
 
     return {
