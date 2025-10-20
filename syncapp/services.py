@@ -4,6 +4,8 @@ import requests
 from django.conf import settings
 import logging
 import traceback
+import time
+import random
 
 logger = logging.getLogger(__name__)
 
@@ -17,14 +19,47 @@ def get_stylia_sync_list():
     if not base.startswith("http://") and not base.startswith("https://"):
         raise RuntimeError(f"STYLIA_BASE_URL does not look like a URL: {base}")
 
+    # ensure credentials are present
+    if not getattr(settings, "STYLIA_USERNAME", None) or not getattr(
+        settings, "STYLIA_PASSWORD", None
+    ):
+        raise RuntimeError(
+            "STYLIA_USERNAME or STYLIA_PASSWORD is not set. Check your .env or environment variables."
+        )
+
     url = f"{base.rstrip('/')}/sync/getItemsList"
-    r = requests.get(
-        url, auth=(settings.STYLIA_USERNAME, settings.STYLIA_PASSWORD), timeout=30
-    )
-    r.raise_for_status()
-    data = r.json()
+    try:
+        r = requests.get(
+            url,
+            auth=(settings.STYLIA_USERNAME, settings.STYLIA_PASSWORD),
+            timeout=30,
+        )
+        # If the endpoint returns an error, capture body for diagnosis
+        if r.status_code >= 400:
+            body = None
+            try:
+                body = r.text
+            except Exception:
+                body = "<unreadable response body>"
+            logger.warning(
+                "Stylia API %s returned %s: %s", url, r.status_code, body[:2000]
+            )
+            hint = ""
+            if r.status_code in (401, 403):
+                hint = (
+                    "\nHINT: authentication failed when calling Stylia. Check that STYLIA_USERNAME/STYLIA_PASSWORD are correct.\n"
+                    'If you store the password in a .env file and it contains spaces or special characters, quote it: STYLIA_PASSWORD="your password".\n'
+                    "Also verify whether Stylia expects a token in headers rather than HTTP Basic auth, or whether the API requires your IP to be allowed."
+                )
+            raise RuntimeError(f"Stylia API returned {r.status_code}: {body}{hint}")
+
+        data = r.json()
+    except requests.exceptions.RequestException as e:
+        logger.exception("Stylia API request failed: %s", e)
+        raise RuntimeError(f"Failed to fetch Stylia data: {e}")
+
     if not data.get("success"):
-        raise RuntimeError(f"Stylia API failed: {data}")
+        raise RuntimeError(f"Stylia API returned success=false: {data}")
     return data.get("result", [])
 
 
@@ -149,14 +184,89 @@ def shopify_headers():
     return {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
 
 
+def shopify_request(method: str, path: str, json_payload=None, params=None, retries=5):
+    """Perform a Shopify API request with retries and basic rate-limit handling.
+
+    path may be a full URL or a path under the store (starting with /admin)
+    """
+    headers = shopify_headers()
+    store = settings.SHOPIFY_STORE_URL
+    if path.startswith("http"):
+        url = path
+    else:
+        url = f"https://{store}{path}"
+
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            r = requests.request(
+                method,
+                url,
+                headers=headers,
+                json=json_payload,
+                params=params,
+                timeout=30,
+            )
+        except requests.exceptions.RequestException as e:
+            if attempt >= retries:
+                raise
+            backoff = (2**attempt) + random.uniform(0, 1)
+            logger.warning(
+                "Shopify request exception, retrying in %.1fs (%s)", backoff, e
+            )
+            time.sleep(backoff)
+            continue
+
+        # If Shopify indicates we're rate-limited, handle Retry-After or backoff
+        if r.status_code in (429, 503):
+            retry_after = r.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    wait = float(retry_after)
+                except Exception:
+                    wait = (2**attempt) + random.uniform(0, 1)
+            else:
+                wait = (2**attempt) + random.uniform(0, 1)
+            if attempt >= retries:
+                r.raise_for_status()
+            logger.warning(
+                "Shopify rate limit or service unavailable (%s). Waiting %.1fs before retrying...",
+                r.status_code,
+                wait,
+            )
+            time.sleep(wait)
+            continue
+
+        # Inspect call-limit header and throttle if we're near capacity
+        call_limit = r.headers.get("X-Shopify-Shop-Api-Call-Limit")
+        try:
+            if call_limit:
+                used, total = call_limit.split("/")
+                used = int(used)
+                total = int(total)
+                if total and used / total > 0.8:
+                    sleep_for = max(0.5, (used / total) * 2)
+                    logger.info(
+                        "Shopify call limit high (%s). Sleeping %.2fs to avoid hitting cap.",
+                        call_limit,
+                        sleep_for,
+                    )
+                    time.sleep(sleep_for)
+        except Exception:
+            pass
+
+        return r
+
+
 def shopify_get_product(product_id):
-    url = f"https://{settings.SHOPIFY_STORE_URL}/admin/api/2025-07/products/{product_id}.json"
-    return requests.get(url, headers=shopify_headers(), timeout=20)
+    path = f"/admin/api/2025-07/products/{product_id}.json"
+    return shopify_request("GET", path)
 
 
 def shopify_create(product_payload):
-    url = f"https://{settings.SHOPIFY_STORE_URL}/admin/api/2025-07/products.json"
-    r = requests.post(url, headers=shopify_headers(), json=product_payload, timeout=30)
+    path = "/admin/api/2025-07/products.json"
+    r = shopify_request("POST", path, json_payload=product_payload)
     if r.status_code not in (200, 201):
         hint = ""
         try:
@@ -176,8 +286,8 @@ def shopify_create(product_payload):
 
 
 def shopify_update(product_id, product_payload):
-    url = f"https://{settings.SHOPIFY_STORE_URL}/admin/api/2025-07/products/{product_id}.json"
-    r = requests.put(url, headers=shopify_headers(), json=product_payload, timeout=30)
+    path = f"/admin/api/2025-07/products/{product_id}.json"
+    r = shopify_request("PUT", path, json_payload=product_payload)
     if r.status_code != 200:
         hint = ""
         try:
@@ -197,8 +307,8 @@ def shopify_update(product_id, product_payload):
 
 
 def shopify_get_locations():
-    url = f"https://{settings.SHOPIFY_STORE_URL}/admin/api/2025-07/locations.json"
-    r = requests.get(url, headers=shopify_headers(), timeout=20)
+    path = "/admin/api/2025-07/locations.json"
+    r = shopify_request("GET", path)
     r.raise_for_status()
     return r.json().get("locations", [])
 
@@ -219,12 +329,12 @@ def resolve_location_id():
 
 
 def inventory_connect(inventory_item_id: int, location_id: str):
-    url = f"https://{settings.SHOPIFY_STORE_URL}/admin/api/2025-07/inventory_levels/connect.json"
+    path = "/admin/api/2025-07/inventory_levels/connect.json"
     payload = {
         "inventory_item_id": int(inventory_item_id),
         "location_id": int(location_id),
     }
-    r = requests.post(url, headers=shopify_headers(), json=payload, timeout=20)
+    r = shopify_request("POST", path, json_payload=payload)
     # 200 OK on success, 422 if already connected (we treat as ok)
     if r.status_code not in (200, 201, 202, 204):
         # many 422s are benign; log and continue
@@ -233,13 +343,13 @@ def inventory_connect(inventory_item_id: int, location_id: str):
 
 
 def inventory_set(inventory_item_id: int, location_id: str, available: int):
-    url = f"https://{settings.SHOPIFY_STORE_URL}/admin/api/2025-07/inventory_levels/set.json"
+    path = "/admin/api/2025-07/inventory_levels/set.json"
     payload = {
         "inventory_item_id": int(inventory_item_id),
         "location_id": int(location_id),
         "available": int(max(0, available or 0)),
     }
-    r = requests.post(url, headers=shopify_headers(), json=payload, timeout=20)
+    r = shopify_request("POST", path, json_payload=payload)
     if r.status_code not in (200, 201):
         logger.warning("inventory_set failed %s: %s", r.status_code, r.text[:500])
     return r

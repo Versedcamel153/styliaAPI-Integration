@@ -2,7 +2,10 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
+# Load .env from project root; fallback to templates/.env if present (some setups put it there)
 load_dotenv(dotenv_path=".env")
+if not (Path(".env")).exists() and (Path("templates/.env")).exists():
+    load_dotenv(dotenv_path="templates/.env")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -69,13 +72,13 @@ STATIC_URL = "/static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # Celery
-CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/0")
+CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL")
 CELERY_RESULT_BACKEND = CELERY_BROKER_URL
 
 # Partner and Store credentials (from existing project constants)
 STYLIA_USERNAME = os.environ.get("STYLIA_USERNAME")
 STYLIA_PASSWORD = os.environ.get("STYLIA_PASSWORD")
-STYLIA_BASE_URL = os.environ.get("STYLIA_BASE_URL")
+STYLIA_BASE_URL = os.environ.get("STYLIA_BASE_URL", "https://api.dropshippingsf.com")
 
 SHOPIFY_STORE_URL = os.environ.get("SHOPIFY_STORE_URL")
 SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN")
@@ -96,3 +99,5 @@ SHOPIFY_OAUTH_SCOPES = os.environ.get(
 )
 # Base URL for the app; used to build the OAuth redirect URI
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://localhost:8000")
+print("Password", STYLIA_PASSWORD)
+print("Username", STYLIA_USERNAME)
