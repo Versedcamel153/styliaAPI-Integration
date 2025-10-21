@@ -75,7 +75,7 @@ DATABASES = {
         'PORT': os.getenv('DB_PORT', '6543'),
         }
     }
-}
+
 
 print("DB SETTINGS:", DATABASES)
 
