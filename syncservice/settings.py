@@ -54,12 +54,24 @@ TEMPLATES = [
 WSGI_APPLICATION = "syncservice.wsgi.application"
 ASGI_APPLICATION = "syncservice.asgi.application"
 
+# DATABASES = {
+#     "default": {
+#         "ENGINE": "django.db.backends.sqlite3",
+#         "NAME": BASE_DIR / "db.sqlite3",
+#     }
+# }
+DATABASE_URL = os.getenv("DATABASE_URL")
 DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
+    'default': {
+        'ENGINE': os.getenv('DB_ENGINE', 'django.db.backends.postgresql'),
+        'NAME': os.getenv('DB_NAME', 'postgres'),
+        'USER': os.getenv('DB_USER', 'postgres.fwftnrqzjzoaxmwftppd'),
+        'PASSWORD': os.getenv('DB_PASSWORD'),
+        'HOST': os.getenv('DB_HOST', 'aws-1-eu-north-1.pooler.supabase.com'),
+        'PORT': os.getenv('DB_PORT', '6543'),
     }
 }
+print("DB PASSWORD", os.getenv('DB_USER'))
 
 AUTH_PASSWORD_VALIDATORS = []
 
@@ -72,7 +84,7 @@ STATIC_URL = "/static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # Celery
-CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL")
+CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/0")
 CELERY_RESULT_BACKEND = CELERY_BROKER_URL
 
 # Partner and Store credentials (from existing project constants)
