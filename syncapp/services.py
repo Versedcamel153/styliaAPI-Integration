@@ -510,6 +510,35 @@ def push_to_shopify():
     for p in qs.iterator():
         try:
             if not p.shopify_id:
+                # pre-check: see if product already exists on Shopify by any variant SKU
+                variants = p.shopify_data.get("product", {}).get("variants") or []
+                skus = [v.get("sku") for v in variants if v.get("sku")]
+                if skus:
+                    found, matched_sku = shopify_find_product_by_skus(skus)
+                    if found:
+                        logger.info(
+                            "Pre-check: product for SKU %s already exists on Shopify (id=%s). Attaching to DB.",
+                            matched_sku,
+                            found.get("id"),
+                        )
+                        p.shopify_id = found.get("id")
+                        p.shopify_handle = found.get("handle")
+                        # attempt to assign inventory based on found product
+                        try:
+                            prod = shopify_get_product(p.shopify_id)
+                            if prod.status_code == 200:
+                                _assign_inventory_to_location(
+                                    prod.json().get("product"), location_id_cache, p
+                                )
+                        except Exception:
+                            logger.exception(
+                                "Failed fetching product %s for inventory assignment",
+                                p.shopify_id,
+                            )
+                        p.mark_as_synced()
+                        updated += 1
+                        continue
+
                 try:
                     created_payload = shopify_create(p.shopify_data)
                 except RuntimeError as e:
