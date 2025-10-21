@@ -4,8 +4,8 @@ import requests
 from django.conf import settings
 import logging
 import traceback
-import time
 import random
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -184,18 +184,11 @@ def shopify_headers():
     return {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
 
 
-def shopify_request(method: str, path: str, json_payload=None, params=None, retries=5):
-    """Perform a Shopify API request with retries and basic rate-limit handling.
+def shopify_request(method, url, max_retries=5, backoff_base=0.5, **kwargs):
+    """Make a resilient request to Shopify with retries and backoff.
 
-    path may be a full URL or a path under the store (starting with /admin)
+    Respects Retry-After header and X-Shopify-Shop-Api-Call-Limit to avoid bursting.
     """
-    headers = shopify_headers()
-    store = settings.SHOPIFY_STORE_URL
-    if path.startswith("http"):
-        url = path
-    else:
-        url = f"https://{store}{path}"
-
     attempt = 0
     while True:
         attempt += 1
@@ -203,70 +196,114 @@ def shopify_request(method: str, path: str, json_payload=None, params=None, retr
             r = requests.request(
                 method,
                 url,
-                headers=headers,
-                json=json_payload,
-                params=params,
-                timeout=30,
+                headers=shopify_headers(),
+                timeout=kwargs.pop("timeout", 30),
+                **kwargs,
             )
         except requests.exceptions.RequestException as e:
-            if attempt >= retries:
+            if attempt >= max_retries:
+                logger.exception(
+                    "Request to Shopify failed after %s attempts: %s %s",
+                    attempt,
+                    method,
+                    url,
+                )
                 raise
-            backoff = (2**attempt) + random.uniform(0, 1)
-            logger.warning(
-                "Shopify request exception, retrying in %.1fs (%s)", backoff, e
+            sleep_for = backoff_base * (2 ** (attempt - 1)) + random.random() * 0.1
+            logger.info(
+                "Request exception, retrying in %.2fs (%s/%s)",
+                sleep_for,
+                attempt,
+                max_retries,
             )
-            time.sleep(backoff)
+            time.sleep(sleep_for)
             continue
 
-        # If Shopify indicates we're rate-limited, handle Retry-After or backoff
-        if r.status_code in (429, 503):
-            retry_after = r.headers.get("Retry-After")
-            if retry_after:
-                try:
-                    wait = float(retry_after)
-                except Exception:
-                    wait = (2**attempt) + random.uniform(0, 1)
-            else:
-                wait = (2**attempt) + random.uniform(0, 1)
-            if attempt >= retries:
-                r.raise_for_status()
-            logger.warning(
-                "Shopify rate limit or service unavailable (%s). Waiting %.1fs before retrying...",
-                r.status_code,
-                wait,
-            )
-            time.sleep(wait)
-            continue
-
-        # Inspect call-limit header and throttle if we're near capacity
+        # If successful, possibly throttle based on call limit header
         call_limit = r.headers.get("X-Shopify-Shop-Api-Call-Limit")
-        try:
-            if call_limit:
+        if call_limit:
+            try:
                 used, total = call_limit.split("/")
                 used = int(used)
                 total = int(total)
-                if total and used / total > 0.8:
-                    sleep_for = max(0.5, (used / total) * 2)
+                # if we're above 80% of the bucket, pause briefly
+                if total and used / total >= 0.8:
+                    sleep_seconds = max(0.5, (used / total) * 0.5)
                     logger.info(
-                        "Shopify call limit high (%s). Sleeping %.2fs to avoid hitting cap.",
+                        "Approaching Shopify call limit (%s). Sleeping %.2fs to avoid bursts.",
                         call_limit,
-                        sleep_for,
+                        sleep_seconds,
                     )
-                    time.sleep(sleep_for)
-        except Exception:
-            pass
+                    time.sleep(sleep_seconds)
+            except Exception:
+                pass
+
+        # Handle 429 and 5xx with backoff and Retry-After
+        if r.status_code == 429 or 500 <= r.status_code < 600:
+            if attempt >= max_retries:
+                logger.error(
+                    "Shopify request failed with %s after %s attempts: %s %s",
+                    r.status_code,
+                    attempt,
+                    method,
+                    url,
+                )
+                r.raise_for_status()
+            # honor Retry-After header if present
+            retry_after = r.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    sleep_for = float(retry_after)
+                except Exception:
+                    sleep_for = backoff_base * (2 ** (attempt - 1))
+            else:
+                sleep_for = backoff_base * (2 ** (attempt - 1)) + random.random() * 0.5
+            logger.info(
+                "Shopify returned %s. Backing off %.2fs (attempt %s/%s)",
+                r.status_code,
+                sleep_for,
+                attempt,
+                max_retries,
+            )
+            time.sleep(sleep_for)
+            continue
 
         return r
 
 
 def shopify_get_product(product_id):
-    path = f"/admin/api/2025-07/products/{product_id}.json"
-    return shopify_request("GET", path)
+    url = f"https://{settings.SHOPIFY_STORE_URL}/admin/api/2025-07/products/{product_id}.json"
+    return shopify_request("GET", url, timeout=20)
+
+
+def shopify_find_product_by_sku(sku):
+    """Search products by variant SKU using the REST products.json endpoint with query param.
+    Returns product JSON or None.
+    """
+    url = f"https://{settings.SHOPIFY_STORE_URL}/admin/api/2025-07/products.json?limit=250&fields=id,handle,variants&sku={sku}"
+    r = shopify_request("GET", url, timeout=20)
+    if r.status_code == 200:
+        data = r.json()
+        products = data.get("products") or []
+        if products:
+            return products[0]
+    return None
+
+
+def shopify_find_product_by_skus(skus):
+    """Try to find a product for any SKU in the iterable `skus`. Returns (product, sku) or (None, None)."""
+    for s in skus or []:
+        if not s:
+            continue
+        found = shopify_find_product_by_sku(s)
+        if found:
+            return found, s
+    return None, None
 
 
 def shopify_create(product_payload):
-    path = "/admin/api/2025-07/products.json"
-    r = shopify_request("POST", path, json_payload=product_payload)
+    url = f"https://{settings.SHOPIFY_STORE_URL}/admin/api/2025-07/products.json"
+    r = shopify_request("POST", url, json=product_payload, timeout=30)
     if r.status_code not in (200, 201):
         hint = ""
         try:
@@ -286,8 +323,8 @@ def shopify_create(product_payload):
 
 
 def shopify_update(product_id, product_payload):
-    path = f"/admin/api/2025-07/products/{product_id}.json"
-    r = shopify_request("PUT", path, json_payload=product_payload)
+    url = f"https://{settings.SHOPIFY_STORE_URL}/admin/api/2025-07/products/{product_id}.json"
+    r = shopify_request("PUT", url, json=product_payload, timeout=30)
     if r.status_code != 200:
         hint = ""
         try:
@@ -307,8 +344,8 @@ def shopify_update(product_id, product_payload):
 
 
 def shopify_get_locations():
-    path = "/admin/api/2025-07/locations.json"
-    r = shopify_request("GET", path)
+    url = f"https://{settings.SHOPIFY_STORE_URL}/admin/api/2025-07/locations.json"
+    r = shopify_request("GET", url, timeout=20)
     r.raise_for_status()
     return r.json().get("locations", [])
 
@@ -329,27 +366,26 @@ def resolve_location_id():
 
 
 def inventory_connect(inventory_item_id: int, location_id: str):
-    path = "/admin/api/2025-07/inventory_levels/connect.json"
+    url = f"https://{settings.SHOPIFY_STORE_URL}/admin/api/2025-07/inventory_levels/connect.json"
     payload = {
         "inventory_item_id": int(inventory_item_id),
         "location_id": int(location_id),
     }
-    r = shopify_request("POST", path, json_payload=payload)
+    r = shopify_request("POST", url, json=payload, timeout=20)
     # 200 OK on success, 422 if already connected (we treat as ok)
     if r.status_code not in (200, 201, 202, 204):
-        # many 422s are benign; log and continue
         logger.info("inventory_connect returned %s: %s", r.status_code, r.text[:500])
     return r
 
 
 def inventory_set(inventory_item_id: int, location_id: str, available: int):
-    path = "/admin/api/2025-07/inventory_levels/set.json"
+    url = f"https://{settings.SHOPIFY_STORE_URL}/admin/api/2025-07/inventory_levels/set.json"
     payload = {
         "inventory_item_id": int(inventory_item_id),
         "location_id": int(location_id),
         "available": int(max(0, available or 0)),
     }
-    r = shopify_request("POST", path, json_payload=payload)
+    r = shopify_request("POST", url, json=payload, timeout=20)
     if r.status_code not in (200, 201):
         logger.warning("inventory_set failed %s: %s", r.status_code, r.text[:500])
     return r
@@ -465,12 +501,46 @@ def push_to_shopify():
 
     qs = StyliaProduct.objects.filter(sync_status="pending")
     created = updated = errors = 0
-
     location_id_cache = resolve_location_id()
+    # pacing controls
+    per_call_sleep = getattr(settings, "SHOPIFY_MIN_SLEEP", 0.3)
+    error_backoff = 0
+    max_backoff = getattr(settings, "SHOPIFY_MAX_BACKOFF", 10)
+
     for p in qs.iterator():
         try:
             if not p.shopify_id:
-                created_payload = shopify_create(p.shopify_data)
+                try:
+                    created_payload = shopify_create(p.shopify_data)
+                except RuntimeError as e:
+                    text = str(e)
+                    # Handle duplicate variant / SKU errors by finding existing product and updating
+                    if "variant" in text.lower() and "already exists" in text.lower():
+                        # attempt to find by SKU from our shopify_data
+                        first_variant = (
+                            p.shopify_data.get("product", {}).get("variants") or [{}]
+                        )[0]
+                        sku = first_variant.get("sku")
+                        if sku:
+                            found = shopify_find_product_by_sku(sku)
+                            if found:
+                                logger.info(
+                                    "Found existing product for SKU %s (id=%s) — switching to update.",
+                                    sku,
+                                    found.get("id"),
+                                )
+                                p.shopify_id = found.get("id")
+                                updated_payload = shopify_update(
+                                    p.shopify_id, p.shopify_data
+                                )
+                                _assign_inventory_to_location(
+                                    updated_payload.get("product"), location_id_cache, p
+                                )
+                                p.mark_as_synced()
+                                updated += 1
+                                continue
+                    # if not handled by fallback, re-raise
+                    raise
                 p.shopify_id = created_payload["product"]["id"]
                 p.shopify_handle = created_payload["product"]["handle"]
                 # After create, try to set inventory at location
@@ -486,6 +556,11 @@ def push_to_shopify():
                 )
                 p.mark_as_synced()
                 updated += 1
+            # on success, gently reduce backoff and sleep to avoid bursts
+            error_backoff = max(0, error_backoff - 0.3)
+            sleep_for = per_call_sleep + error_backoff
+            if sleep_for:
+                time.sleep(sleep_for)
         except Exception as exc:
             # capture full traceback and a short message to persist on the model
             tb = traceback.format_exc()
@@ -497,9 +572,10 @@ def push_to_shopify():
             try:
                 p.mark_as_failed(message=short)
             except Exception:
-                # ensure we don't raise while handling an error; log and continue
                 logger.exception("Failed to mark product %s as failed", p.model_code)
             errors += 1
+            # increase backoff on errors so subsequent calls are slowed
+            error_backoff = min(max_backoff, error_backoff + 1.0)
 
     return {
         "success": True,
