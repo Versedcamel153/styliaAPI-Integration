@@ -1,8 +1,13 @@
 from celery import shared_task
 from django.utils import timezone
+from django.conf import settings
+import logging
+
 from .services import reconcile_shopify_state, ingest_stylia, push_to_shopify
 from .services import push_single_product
 from .models import SyncLog
+
+logger = logging.getLogger(__name__)
 
 
 @shared_task
@@ -13,7 +18,22 @@ def run_full_sync():
         SyncLog.objects.filter(completed_at__isnull=True).order_by("started_at").first()
     )
     if active:
-        return {"success": False, "error": "sync_already_running"}
+        # allow auto-expire of stale locks (seconds)
+        ttl = getattr(settings, "SYNCLOG_TTL_SECONDS", 60 * 60)
+        age = timezone.now() - active.started_at
+        if age.total_seconds() > ttl:
+            # mark the stale run completed with an error and continue
+            logger.warning(
+                "Expiring stale SyncLog started_at=%s (age=%.0fs) and continuing",
+                active.started_at,
+                age.total_seconds(),
+            )
+            try:
+                active.mark_completed(success=False, error_message="stale_lock_expired")
+            except Exception:
+                logger.exception("Failed to expire stale SyncLog %s", active.pk)
+        else:
+            return {"success": False, "error": "sync_already_running"}
 
     log = SyncLog.objects.create(started_at=timezone.now())
     t0 = reconcile_shopify_state()

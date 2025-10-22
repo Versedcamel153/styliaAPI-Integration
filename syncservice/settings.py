@@ -122,6 +122,7 @@ print("Username", STYLIA_USERNAME)
 
 # Shopify rate control defaults
 # Minimum sleep between Shopify API calls (seconds)
+SYNCLOG_TTL_SECONDS = 900  # 15 minutes
 SHOPIFY_MIN_SLEEP = float(os.environ.get("SHOPIFY_MIN_SLEEP", "0.8"))
 # Maximum backoff used by the request wrapper (seconds)
 SHOPIFY_MAX_BACKOFF = float(os.environ.get("SHOPIFY_MAX_BACKOFF", "10"))
