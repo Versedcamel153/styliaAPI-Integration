@@ -66,15 +66,15 @@ DATABASES = {
     # "default": {
     #     "ENGINE": "django.db.backends.sqlite3",
     #     "NAME": BASE_DIR / "db.sqlite3",
-    'default': {
-        'ENGINE': os.getenv('DB_ENGINE', 'django.db.backends.postgresql'),
-        'NAME': os.getenv('DB_NAME', 'postgres'),
-        'USER': os.getenv('DB_USER', 'postgres.fwftnrqzjzoaxmwftppd'),
-        'PASSWORD': os.getenv('DB_PASSWORD'),
-        'HOST': os.getenv('DB_HOST', 'aws-1-eu-north-1.pooler.supabase.com'),
-        'PORT': os.getenv('DB_PORT', '6543'),
-        }
+    "default": {
+        "ENGINE": os.getenv("DB_ENGINE", "django.db.backends.postgresql"),
+        "NAME": os.getenv("DB_NAME", "postgres"),
+        "USER": os.getenv("DB_USER", "postgres.fwftnrqzjzoaxmwftppd"),
+        "PASSWORD": os.getenv("DB_PASSWORD"),
+        "HOST": os.getenv("DB_HOST", "aws-1-eu-north-1.pooler.supabase.com"),
+        "PORT": os.getenv("DB_PORT", "6543"),
     }
+}
 
 
 print("DB SETTINGS:", DATABASES)
@@ -119,3 +119,11 @@ SHOPIFY_OAUTH_SCOPES = os.environ.get(
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://localhost:8000")
 print("Password", STYLIA_PASSWORD)
 print("Username", STYLIA_USERNAME)
+
+# Shopify rate control defaults
+# Minimum sleep between Shopify API calls (seconds)
+SHOPIFY_MIN_SLEEP = float(os.environ.get("SHOPIFY_MIN_SLEEP", "0.8"))
+# Maximum backoff used by the request wrapper (seconds)
+SHOPIFY_MAX_BACKOFF = float(os.environ.get("SHOPIFY_MAX_BACKOFF", "10"))
+# How many pending products to process per run
+SHOPIFY_BATCH_SIZE = int(os.environ.get("SHOPIFY_BATCH_SIZE", "20"))

@@ -499,14 +499,21 @@ def ingest_stylia():
 def push_to_shopify():
     from .models import StyliaProduct
 
+    batch_size = getattr(settings, "SHOPIFY_BATCH_SIZE", 20)
     qs = StyliaProduct.objects.filter(sync_status="pending")
     created = updated = errors = 0
     location_id_cache = resolve_location_id()
     # pacing controls
-    per_call_sleep = getattr(settings, "SHOPIFY_MIN_SLEEP", 0.3)
+    per_call_sleep = getattr(settings, "SHOPIFY_MIN_SLEEP", 0.8)
     error_backoff = 0
     max_backoff = getattr(settings, "SHOPIFY_MAX_BACKOFF", 10)
 
+    # process oldest pending products first (FIFO)
+    qs = (
+        StyliaProduct.objects.filter(sync_status="pending")
+        .order_by("updated_at")
+        .all()[:batch_size]
+    )
     for p in qs.iterator():
         try:
             if not p.shopify_id:
