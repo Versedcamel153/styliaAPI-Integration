@@ -93,3 +93,26 @@ class ShopifyApp(models.Model):
 
     def __str__(self):
         return f"{self.shop_domain}"
+
+
+class Variant(models.Model):
+    """Persist mapping between a StyliaProduct variant (SKU) and Shopify ids.
+
+    This allows idempotent updates and inventory assignment without relying on
+    searching the shop via products.json for SKUs.
+    """
+
+    stylia_product = models.ForeignKey(
+        StyliaProduct, on_delete=models.CASCADE, related_name="variants"
+    )
+    sku = models.CharField(max_length=100, db_index=True)
+    shopify_variant_id = models.CharField(max_length=50, blank=True, null=True)
+    inventory_item_id = models.CharField(max_length=50, blank=True, null=True)
+    shopify_product_id = models.CharField(max_length=50, blank=True, null=True)
+    price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+
+    class Meta:
+        unique_together = ("stylia_product", "sku")
+
+    def __str__(self):
+        return f"{self.stylia_product.model_code} / {self.sku} -> {self.shopify_variant_id}"

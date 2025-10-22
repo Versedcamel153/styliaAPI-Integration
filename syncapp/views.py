@@ -3,7 +3,7 @@ from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.core.paginator import Paginator
 from .models import StyliaProduct
-from .tasks import run_full_sync
+from .tasks import run_full_sync, push_product
 import json
 from django.conf import settings
 from django.shortcuts import redirect
@@ -11,6 +11,12 @@ from django.urls import reverse
 from .models import ShopifyApp
 import requests
 from django.utils import timezone
+from django.views.decorators.csrf import csrf_exempt
+
+from . import services
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def dashboard(request):
@@ -76,7 +82,8 @@ def api_reenable_product(request, pk):
     push_now = request.GET.get("push") == "1" or payload.get("push_now") is True
     if push_now:
         try:
-            task = run_full_sync.delay()
+            # Use the single-product push task to avoid starting a full sync
+            task = push_product.delay(product.pk)
             return JsonResponse(
                 {"success": True, "task_id": task.id, "pushed_immediately": True}
             )
@@ -152,3 +159,90 @@ def shopify_callback(request):
 
     # Redirect to dashboard with a simple success message
     return redirect(reverse("sync_dashboard") + "?installed=1")
+
+
+@csrf_exempt
+def delete_product(request, pk):
+    """Delete a product that hasnt been pushed yet."""
+    # For consistency with other API endpoints, require POST and be CSRF-exempt
+    from django.views.decorators.csrf import csrf_exempt
+
+    @csrf_exempt
+    def _inner(req, pk):
+        if req.method != "POST":
+            return JsonResponse(
+                {"success": False, "error": "POST required"}, status=405
+            )
+        product = get_object_or_404(StyliaProduct, pk=pk)
+        if product.shopify_id:
+            return JsonResponse(
+                {"success": False, "error": "Cannot delete a product already pushed"},
+                status=400,
+            )
+        product.delete()
+        return JsonResponse({"success": True})
+
+    return _inner(request, pk)
+
+
+@csrf_exempt
+def api_delete_all_pushed(request):
+    """Delete all products that were pushed to Shopify (best-effort).
+
+    This will attempt to DELETE the product via Shopify Admin API, remove any
+    Variant mappings, and mark the StyliaProduct as deleted.
+    """
+    if request.method != "POST":
+        return JsonResponse({"success": False, "error": "POST required"}, status=405)
+
+    from .models import Variant
+
+    # Materialize product list to avoid cursor invalidation during deletes
+    products = list(StyliaProduct.objects.values("id", "shopify_id", "model_code"))
+    attempted_shopify = 0
+    shopify_deleted = 0
+    db_deleted = 0
+    errors = []
+    for row in products:
+        pk = row.get("id")
+        shopify_id = row.get("shopify_id")
+        model_code = row.get("model_code")
+        if shopify_id:
+            attempted_shopify += 1
+            try:
+                url = f"https://{settings.SHOPIFY_STORE_URL}/admin/api/2025-07/products/{shopify_id}.json"
+                r = services.shopify_request("DELETE", url, timeout=30)
+                if r.status_code in (200, 202, 204) or r.status_code == 404:
+                    shopify_deleted += 1
+                else:
+                    errors.append(
+                        {
+                            "model_code": model_code,
+                            "status": r.status_code,
+                            "body": r.text[:1000],
+                        }
+                    )
+            except Exception as e:
+                logger.exception("Failed to delete product %s from Shopify", model_code)
+                errors.append({"model_code": model_code, "error": str(e)})
+        # Regardless of Shopify result or missing shopify_id, remove Variant mappings and delete DB row
+        try:
+            Variant.objects.filter(stylia_product_id=pk).delete()
+        except Exception:
+            logger.exception("Failed deleting Variant rows for %s", model_code)
+        try:
+            StyliaProduct.objects.filter(pk=pk).delete()
+            db_deleted += 1
+        except Exception:
+            logger.exception("Failed deleting StyliaProduct %s from DB", model_code)
+            errors.append({"model_code": model_code, "error": "db_delete_failed"})
+
+    return JsonResponse(
+        {
+            "success": True,
+            "attempted_shopify_deletes": attempted_shopify,
+            "shopify_deleted": shopify_deleted,
+            "db_deleted": db_deleted,
+            "errors": errors,
+        }
+    )

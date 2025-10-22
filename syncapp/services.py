@@ -276,22 +276,109 @@ def shopify_get_product(product_id):
     return shopify_request("GET", url, timeout=20)
 
 
+def shopify_graphql_request(query, variables=None, timeout=30):
+    """Simple GraphQL request helper for Shopify Admin API."""
+    url = f"https://{settings.SHOPIFY_STORE_URL}/admin/api/2025-07/graphql.json"
+    payload = {"query": query}
+    if variables:
+        payload["variables"] = variables
+    r = shopify_request("POST", url, json=payload, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
 def shopify_find_product_by_sku(sku):
-    """Search products by variant SKU using the REST products.json endpoint with query param.
-    Returns product JSON or None.
+    """Try GraphQL product search for a SKU first, fall back to REST products.json if necessary.
+    Returns product dict (GraphQL shape converted) or None.
     """
-    url = f"https://{settings.SHOPIFY_STORE_URL}/admin/api/2025-07/products.json?limit=250&fields=id,handle,variants&sku={sku}"
-    r = shopify_request("GET", url, timeout=20)
-    if r.status_code == 200:
-        data = r.json()
-        products = data.get("products") or []
-        if products:
-            return products[0]
+    if not sku:
+        return None
+    # GraphQL search by variant SKU
+    try:
+        query = """
+        query productBySKU($query: String!) {
+          products(first: 1, query: $query) {
+            edges { node { id handle variants(first: 10) { edges { node { id sku inventoryItem { id } } } } } }
+          }
+        }
+        """
+        # Shopify product search query syntax: "variants:sku:SKUVALUE"
+        gql_query = f"variants:sku:{sku}"
+        result = shopify_graphql_request(
+            query, variables={"query": gql_query}, timeout=20
+        )
+        # traverse response
+        prod_edges = result.get("data", {}).get("products", {}).get("edges", [])
+        if prod_edges:
+            node = prod_edges[0].get("node")
+            # convert node to a light REST-like dict for compatibility
+            product = {
+                "id": node.get("id").split("/")[-1] if node.get("id") else None,
+                "handle": node.get("handle"),
+                "variants": [],
+            }
+            for ve in node.get("variants", {}).get("edges", []):
+                v = ve.get("node")
+                inv = v.get("inventoryItem") or {}
+                product["variants"].append(
+                    {
+                        "id": v.get("id").split("/")[-1] if v.get("id") else None,
+                        "sku": v.get("sku"),
+                        "inventory_item_id": (
+                            inv.get("id").split("/")[-1] if inv.get("id") else None
+                        ),
+                    }
+                )
+            return product
+    except Exception as e:
+        logger.info("GraphQL SKU search failed, falling back to REST: %s", e)
+
+    # Fallback to REST products.json endpoint (existing behavior)
+    try:
+        url = f"https://{settings.SHOPIFY_STORE_URL}/admin/api/2025-07/products.json?limit=250&fields=id,handle,variants&sku={sku}"
+        r = shopify_request("GET", url, timeout=20)
+        if r.status_code == 200:
+            data = r.json()
+            products = data.get("products") or []
+            if products:
+                return products[0]
+    except Exception:
+        logger.exception("REST SKU search failed for %s", sku)
     return None
 
 
 def shopify_find_product_by_skus(skus):
     """Try to find a product for any SKU in the iterable `skus`. Returns (product, sku) or (None, None)."""
+    # First try DB mapped variants for a fast resolution
+    try:
+        from .models import Variant
+
+        skus_list = [s for s in (skus or []) if s]
+        if skus_list:
+            v = (
+                Variant.objects.filter(sku__in=skus_list)
+                .exclude(shopify_product_id__isnull=True)
+                .exclude(shopify_product_id="")
+                .first()
+            )
+            if v:
+                # Return a light product dict built from DB mapping
+                product = {
+                    "id": v.shopify_product_id,
+                    "handle": v.stylia_product.shopify_handle or "",
+                    "variants": [
+                        {
+                            "id": v.shopify_variant_id,
+                            "sku": v.sku,
+                            "inventory_item_id": v.inventory_item_id,
+                        }
+                    ],
+                }
+                return product, v.sku
+    except Exception:
+        logger.exception("Error checking Variant DB for SKUs")
+
+    # Fall back to live lookups (GraphQL then REST)
     for s in skus or []:
         if not s:
             continue
@@ -319,7 +406,44 @@ def shopify_create(product_payload):
         except Exception:
             hint = ""
         raise RuntimeError(f"Shopify create failed: {r.status_code} - {r.text}{hint}")
-    return r.json()
+    data = r.json()
+    # persist variant/shopify ids if possible
+    try:
+        from .models import Variant, StyliaProduct
+
+        prod = data.get("product") or {}
+        shopify_product_id = prod.get("id")
+        # Try to find the corresponding StyliaProduct via a tag or handle not always possible
+        # We leave the caller to set StyliaProduct.shopify_id; here we persist variants if we can
+        # Map by SKU
+        variants = prod.get("variants") or []
+        for v in variants:
+            sku = v.get("sku")
+            if not sku:
+                continue
+            # find whichever StyliaProduct has this SKU in its shopify_data
+            sp = StyliaProduct.objects.filter(
+                shopify_data__product__variants__contains=[{"sku": sku}]
+            ).first()
+            if not sp:
+                # fallback: try by product handle
+                sp = StyliaProduct.objects.filter(
+                    shopify_handle=prod.get("handle")
+                ).first()
+            if sp:
+                Variant.objects.update_or_create(
+                    stylia_product=sp,
+                    sku=sku,
+                    defaults={
+                        "shopify_variant_id": v.get("id"),
+                        "inventory_item_id": v.get("inventory_item_id"),
+                        "shopify_product_id": shopify_product_id,
+                        "price": v.get("price") or None,
+                    },
+                )
+    except Exception:
+        logger.exception("Failed to persist variant mappings after create")
+    return data
 
 
 def shopify_update(product_id, product_payload):
@@ -340,7 +464,38 @@ def shopify_update(product_id, product_payload):
         except Exception:
             hint = ""
         raise RuntimeError(f"Shopify update failed: {r.status_code} - {r.text}{hint}")
-    return r.json()
+    data = r.json()
+    try:
+        from .models import Variant, StyliaProduct
+
+        prod = data.get("product") or {}
+        shopify_product_id = prod.get("id")
+        variants = prod.get("variants") or []
+        for v in variants:
+            sku = v.get("sku")
+            if not sku:
+                continue
+            sp = StyliaProduct.objects.filter(
+                shopify_id=str(shopify_product_id)
+            ).first()
+            if not sp:
+                sp = StyliaProduct.objects.filter(
+                    shopify_handle=prod.get("handle")
+                ).first()
+            if sp:
+                Variant.objects.update_or_create(
+                    stylia_product=sp,
+                    sku=sku,
+                    defaults={
+                        "shopify_variant_id": v.get("id"),
+                        "inventory_item_id": v.get("inventory_item_id"),
+                        "shopify_product_id": shopify_product_id,
+                        "price": v.get("price") or None,
+                    },
+                )
+    except Exception:
+        logger.exception("Failed to persist variant mappings after update")
+    return data
 
 
 def shopify_get_locations():
@@ -523,29 +678,59 @@ def push_to_shopify():
                     text = str(e)
                     # Handle duplicate variant / SKU errors by finding existing product and updating
                     if "variant" in text.lower() and "already exists" in text.lower():
-                        # attempt to find by SKU from our shopify_data
-                        first_variant = (
-                            p.shopify_data.get("product", {}).get("variants") or [{}]
-                        )[0]
-                        sku = first_variant.get("sku")
-                        if sku:
-                            found = shopify_find_product_by_sku(sku)
-                            if found:
-                                logger.info(
-                                    "Found existing product for SKU %s (id=%s) — switching to update.",
-                                    sku,
-                                    found.get("id"),
-                                )
+                        # attempt to find by any SKU from our shopify_data (all variants)
+                        skus = [
+                            v.get("sku")
+                            for v in p.shopify_data.get("product", {}).get("variants")
+                            or []
+                        ]
+                        found, found_sku = shopify_find_product_by_skus(skus)
+                        if found:
+                            logger.info(
+                                "Found existing product for SKU %s (id=%s) — switching to update.",
+                                found_sku,
+                                found.get("id"),
+                            )
+                            # persist mapping to DB
+                            try:
                                 p.shopify_id = found.get("id")
-                                updated_payload = shopify_update(
-                                    p.shopify_id, p.shopify_data
+                                p.shopify_handle = (
+                                    found.get("handle") or p.shopify_handle
                                 )
-                                _assign_inventory_to_location(
-                                    updated_payload.get("product"), location_id_cache, p
+                                p.save(update_fields=["shopify_id", "shopify_handle"])
+                                # persist variant mappings from found product
+                                from .models import Variant
+
+                                for v in found.get("variants") or []:
+                                    sku_val = v.get("sku")
+                                    if not sku_val:
+                                        continue
+                                    Variant.objects.update_or_create(
+                                        stylia_product=p,
+                                        sku=sku_val,
+                                        defaults={
+                                            "shopify_variant_id": v.get("id"),
+                                            "inventory_item_id": v.get(
+                                                "inventory_item_id"
+                                            ),
+                                            "shopify_product_id": found.get("id"),
+                                        },
+                                    )
+                            except Exception:
+                                logger.exception(
+                                    "Failed to persist variant mapping when switching to update"
                                 )
-                                p.mark_as_synced()
-                                updated += 1
-                                continue
+
+                            # Now try update flow using the found product id
+                            updated_payload = shopify_update(
+                                p.shopify_id, p.shopify_data
+                            )
+                            _assign_inventory_to_location(
+                                updated_payload.get("product"), location_id_cache, p
+                            )
+                            p.mark_as_synced()
+                            updated += 1
+                            continue
                     # if not handled by fallback, re-raise
                     raise
                 p.shopify_id = created_payload["product"]["id"]
@@ -583,6 +768,96 @@ def push_to_shopify():
             errors += 1
             # increase backoff on errors so subsequent calls are slowed
             error_backoff = min(max_backoff, error_backoff + 1.0)
+
+    return {
+        "success": True,
+        "summary": {"created": created, "updated": updated, "errors": errors},
+    }
+
+
+def push_single_product(product_id):
+    """Push a single product by id (create or update) and return result dict.
+    This is intended to be called from a task to avoid scheduling a full sync.
+    """
+    from .models import StyliaProduct
+
+    try:
+        p = StyliaProduct.objects.get(pk=product_id)
+    except StyliaProduct.DoesNotExist:
+        return {"success": False, "error": "not_found"}
+
+    location_id_cache = resolve_location_id()
+    created = updated = errors = 0
+    try:
+        if not p.shopify_id:
+            try:
+                created_payload = shopify_create(p.shopify_data)
+                p.shopify_id = created_payload["product"]["id"]
+                p.shopify_handle = created_payload["product"].get("handle")
+                _assign_inventory_to_location(
+                    created_payload["product"], location_id_cache, p
+                )
+                p.mark_as_synced()
+                created = 1
+            except RuntimeError as e:
+                text = str(e)
+                if "variant" in text.lower() and "already exists" in text.lower():
+                    skus = [
+                        v.get("sku")
+                        for v in p.shopify_data.get("product", {}).get("variants") or []
+                    ]
+                    found, found_sku = shopify_find_product_by_skus(skus)
+                    if found:
+                        # Found existing product, switch to update
+                        try:
+                            p.shopify_id = found.get("id")
+                            p.shopify_handle = found.get("handle") or p.shopify_handle
+                            p.save(update_fields=["shopify_id", "shopify_handle"])
+                            from .models import Variant
+
+                            for v in found.get("variants") or []:
+                                sku_val = v.get("sku")
+                                if not sku_val:
+                                    continue
+                                Variant.objects.update_or_create(
+                                    stylia_product=p,
+                                    sku=sku_val,
+                                    defaults={
+                                        "shopify_variant_id": v.get("id"),
+                                        "inventory_item_id": v.get("inventory_item_id"),
+                                        "shopify_product_id": found.get("id"),
+                                    },
+                                )
+                        except Exception:
+                            logger.exception(
+                                "Failed to persist variant mapping when switching to update (single push)"
+                            )
+
+                        updated_payload = shopify_update(p.shopify_id, p.shopify_data)
+                        _assign_inventory_to_location(
+                            updated_payload["product"], location_id_cache, p
+                        )
+                        p.mark_as_synced()
+                        updated = 1
+                    else:
+                        raise
+                else:
+                    raise
+        else:
+            updated_payload = shopify_update(p.shopify_id, p.shopify_data)
+            _assign_inventory_to_location(
+                updated_payload.get("product"), location_id_cache, p
+            )
+            p.mark_as_synced()
+            updated = 1
+    except Exception:
+        tb = traceback.format_exc()
+        logger.exception("Failed pushing single product %s: %s", p.model_code, tb)
+        try:
+            p.mark_as_failed(message=tb[:2000])
+        except Exception:
+            logger.exception("Failed to mark single product %s as failed", p.model_code)
+        errors = 1
 
     return {
         "success": True,

@@ -25,6 +25,24 @@
             <div class="text-gray-500 text-sm">Deleted</div>
             <div class="text-2xl font-semibold text-gray-600">{{ stats.deleted }}</div>
         </div> -->
+
+        <script>
+            async function deleteProduct(id) {
+                if (!confirm('Are you sure you want to delete this product from the sync list? This will not delete it from Shopify or Stylia.')) return;
+                try {
+                    const res = await fetch(`/api/products/${id}/delete/`, { method: 'POST' });
+                    const data = await res.json();
+                    if (data.success) {
+                        // Refresh to show the updated list
+                        window.location.reload();
+                    } else {
+                        alert('Failed: ' + (data.error || 'unknown'));
+                    }
+                } catch (e) {
+                    alert('Request failed: ' + e.message);
+                }
+            }
+        </script>
     </div>
 
     <div class="flex items-center gap-2">
@@ -39,6 +57,8 @@
         </select>
         <button onclick="triggerSync()" class="bg-blue-600 hover:bg-blue-700 text-white rounded px-4 py-2">Run Sync
             Now</button>
+        <button onclick="deleteAllPushed()"
+            class="ml-2 bg-red-600 hover:bg-red-700 text-white rounded px-4 py-2 text-sm">Delete All Pushed</button>
         <!-- {% if shopify_store_url %}
         <a href="/shopify/install/?shop={{ shopify_store_url }}"
             class="ml-2 bg-gray-700 hover:bg-gray-800 text-white rounded px-3 py-2 text-sm">Install / Reinstall Shopify
@@ -58,8 +78,9 @@
                 <th class="px-4 py-2 text-left text-xs font-medium text-gray-500">Status</th>
                 <th class="px-4 py-2 text-left text-xs font-medium text-gray-500">Stock</th>
                 <th class="px-4 py-2 text-left text-xs font-medium text-gray-500">Shopify Link</th>
-                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500">Location</th>
+                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500">Location (Stylia Warehouse)</th>
                 <th class="px-4 py-2 text-left text-xs font-medium text-gray-500">Push Error</th>
+                <th class="px-4 py-2"></th>
                 <th class="px-4 py-2"></th>
             </tr>
         </thead>
@@ -110,6 +131,13 @@
                         class="text-sm bg-green-600 hover:bg-green-700 text-white rounded px-3 py-1">Re-enable</button>
                     {% endif %}
                 </td>
+                {% if p.sync_status == 'failed' %}
+                <td class="px-4 py-2 text-right">
+                    <button onclick="deleteProduct('{{ p.id }}')"
+                        class="text-sm bg-red-600 hover:bg-red-700 text-white rounded px-3 py-1">Delete</button>
+                </td>
+                {% endif %}
+
             </tr>
             {% empty %}
             <tr>
@@ -168,6 +196,22 @@
                 window.location.reload();
             } else {
                 alert('Failed: ' + data.error)
+            }
+        } catch (e) {
+            alert('Request failed: ' + e.message);
+        }
+    }
+
+    async function deleteAllPushed() {
+        if (!confirm('Delete ALL pushed products from Shopify and the local DB? This is irreversible.')) return;
+        try {
+            const res = await fetch('/api/delete-all-pushed/', { method: 'POST' });
+            const data = await res.json();
+            if (data.success) {
+                alert('Deleted ' + (data.deleted || 0) + ' products.');
+                window.location.reload();
+            } else {
+                alert('Failed: ' + (data.error || JSON.stringify(data.errors || data)));
             }
         } catch (e) {
             alert('Request failed: ' + e.message);

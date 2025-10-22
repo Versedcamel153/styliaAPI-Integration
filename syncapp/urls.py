@@ -11,4 +11,12 @@ urlpatterns = [
     ),
     path("shopify/install/", views.shopify_install, name="shopify_install"),
     path("shopify/callback/", views.shopify_callback, name="shopify_callback"),
+    path(
+        "api/products/<int:pk>/delete/", views.delete_product, name="api_delete_product"
+    ),
+    path(
+        "api/delete-all-pushed/",
+        views.api_delete_all_pushed,
+        name="api_delete_all_pushed",
+    ),
 ]
