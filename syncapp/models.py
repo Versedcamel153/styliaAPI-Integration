@@ -67,6 +67,9 @@ class SyncLog(models.Model):
     error_message = models.TextField(blank=True)
     products_created = models.IntegerField(default=0)
     products_updated = models.IntegerField(default=0)
+    # Count of records that were found to already exist in Shopify and were linked/mapped
+    # instead of being created. Useful to monitor duplicate-prevention effectiveness.
+    products_existing = models.IntegerField(default=0)
     products_deleted = models.IntegerField(default=0)
     products_errors = models.IntegerField(default=0)
     stylia_products_count = models.IntegerField(default=0)

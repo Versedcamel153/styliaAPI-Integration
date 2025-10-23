@@ -63,9 +63,6 @@ ASGI_APPLICATION = "syncservice.asgi.application"
 
 
 DATABASES = {
-    # "default": {
-    #     "ENGINE": "django.db.backends.sqlite3",
-    #     "NAME": BASE_DIR / "db.sqlite3",
     "default": {
         "ENGINE": os.getenv("DB_ENGINE", "django.db.backends.postgresql"),
         "NAME": os.getenv("DB_NAME", "postgres"),
@@ -75,6 +72,21 @@ DATABASES = {
         "PORT": os.getenv("DB_PORT", "6543"),
     }
 }
+
+# Developer-friendly fallback: if Postgres is selected but no password is provided,
+# automatically fall back to a local SQLite database to avoid runtime failures.
+# if (
+#     DATABASES["default"]["ENGINE"].endswith("postgresql")
+#     and not DATABASES["default"].get("PASSWORD")
+#     and not os.getenv("PGPASSWORD")
+# ):
+#     print("No DB_PASSWORD provided for Postgres; falling back to SQLite (dev mode)")
+#     DATABASES = {
+#         "default": {
+#             "ENGINE": "django.db.backends.sqlite3",
+#             "NAME": BASE_DIR / "db.sqlite3",
+#         }
+#     }
 
 
 print("DB SETTINGS:", DATABASES)
@@ -128,3 +140,13 @@ SHOPIFY_MIN_SLEEP = float(os.environ.get("SHOPIFY_MIN_SLEEP", "0.8"))
 SHOPIFY_MAX_BACKOFF = float(os.environ.get("SHOPIFY_MAX_BACKOFF", "10"))
 # How many pending products to process per run
 SHOPIFY_BATCH_SIZE = int(os.environ.get("SHOPIFY_BATCH_SIZE", "20"))
+
+# Optional cross-process rate limiter using Redis (tokens per second)
+SHOPIFY_RATE_LIMIT_TOKENS_PER_SEC = float(
+    os.environ.get("SHOPIFY_RATE_LIMIT_TOKENS_PER_SEC", "2")
+)
+SHOPIFY_RATE_LIMIT_CAPACITY = int(os.environ.get("SHOPIFY_RATE_LIMIT_CAPACITY", "4"))
+# Use explicit URL if provided, else try Celery broker URL
+SHOPIFY_RATE_LIMIT_REDIS_URL = os.environ.get(
+    "SHOPIFY_RATE_LIMIT_REDIS_URL", os.environ.get("CELERY_BROKER_URL", "")
+)

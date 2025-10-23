@@ -3,7 +3,14 @@ from django.utils import timezone
 from django.conf import settings
 import logging
 
-from .services import reconcile_shopify_state, ingest_stylia, push_to_shopify
+from .services import (
+    reconcile_shopify_state,
+    ingest_stylia,
+    push_to_shopify,
+    process_creations,
+    process_updates,
+    ensure_location_assignments,
+)
 from .services import push_single_product
 from .models import SyncLog
 
@@ -38,10 +45,18 @@ def run_full_sync():
     log = SyncLog.objects.create(started_at=timezone.now())
     t0 = reconcile_shopify_state()
     t1 = ingest_stylia()
-    t2 = push_to_shopify()
-    log.products_created = t2["summary"]["created"]
-    log.products_updated = t2["summary"]["updated"]
-    log.products_errors = t2["summary"]["errors"]
+    # Process creations first, then updates (separate queues)
+    c_res = process_creations()
+    u_res = process_updates()
+    # Ensure inventory is connected and quantities set at the configured location each run
+    loc_res = ensure_location_assignments()
+    log.products_created = c_res["summary"]["created"]
+    log.products_updated = u_res["summary"]["updated"]
+    # Persist count of products that already existed in Shopify and were only mapped/linked
+    log.products_existing = c_res["summary"].get("existing", 0) + u_res["summary"].get(
+        "existing", 0
+    )
+    log.products_errors = c_res["summary"]["errors"] + u_res["summary"]["errors"]
     log.stylia_products_count = t1["summary"]["unique"]
     log.mark_completed(success=True)
 
@@ -49,10 +64,22 @@ def run_full_sync():
         "timestamp": timezone.now().isoformat(),
         "reconcile": t0,
         "ingest": t1,
-        "push": t2,
+        "creations": c_res,
+        "updates": u_res,
+        "location": loc_res,
     }
 
 
 @shared_task
 def push_product(product_id):
     return push_single_product(product_id)
+
+
+@shared_task
+def run_process_creations():
+    return process_creations()
+
+
+@shared_task
+def run_process_updates():
+    return process_updates()

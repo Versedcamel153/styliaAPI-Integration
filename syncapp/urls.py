@@ -19,4 +19,9 @@ urlpatterns = [
         views.api_delete_all_pushed,
         name="api_delete_all_pushed",
     ),
+    path(
+        "api/delete-all-local/",
+        views.api_delete_all_local,
+        name="api_delete_all_local",
+    ),
 ]

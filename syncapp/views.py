@@ -33,6 +33,10 @@ def dashboard(request):
         qs = qs.filter(sync_status="failed")
     elif show == "deleted":
         qs = qs.filter(sync_status="deleted")
+    elif show == "existing":
+        # Products that already existed in Shopify and were linked/mapped (no create)
+        # Use JSON containment to be portable across DB backends
+        qs = qs.filter(shopify_data__contains={"existing_info": {}})
 
     paginator = Paginator(qs, 25)
     page = request.GET.get("page")
@@ -46,6 +50,10 @@ def dashboard(request):
         "pending": StyliaProduct.objects.filter(sync_status="pending").count(),
         "failed": StyliaProduct.objects.filter(sync_status="failed").count(),
         "deleted": StyliaProduct.objects.filter(sync_status="deleted").count(),
+        # Count of products we tried to create but linked to existing Shopify records instead
+        "already_existing": StyliaProduct.objects.filter(
+            shopify_data__contains={"existing_info": {}}
+        ).count(),
     }
 
     return render(
@@ -187,45 +195,94 @@ def delete_product(request, pk):
 
 @csrf_exempt
 def api_delete_all_pushed(request):
-    """Delete all products that were pushed to Shopify (best-effort).
+    """Delete Shopify products only (best-effort) for the configured warehouse location.
 
-    This will attempt to DELETE the product via Shopify Admin API, remove any
-    Variant mappings, and mark the StyliaProduct as deleted.
+    This enumerates inventory levels for the configured location, finds related variants
+    and product IDs, then deletes those products globally from Shopify.
+    Local DB rows are NOT removed by this endpoint.
     """
+    # Allow GET for dry-run discovery, POST for deletion
+    if request.method not in ("GET", "POST"):
+        return JsonResponse(
+            {"success": False, "error": "GET or POST required"}, status=405
+        )
+    logger.info(
+        "api_delete_all_pushed called: method=%s, path=%s",
+        request.method,
+        request.get_full_path(),
+    )
+
+    location_id = services.resolve_location_id()
+    if not location_id:
+        return JsonResponse(
+            {"success": False, "error": "No Shopify location configured or found"},
+            status=400,
+        )
+
+    try:
+        product_ids = services.shopify_find_product_ids_by_location(location_id)
+    except Exception as e:
+        logger.exception("Failed to find product ids by location")
+        return JsonResponse({"success": False, "error": str(e)}, status=500)
+
+    # If GET (dry-run) or POST?dry_run=1, do not delete, just report
+    dry_run = request.method == "GET" or request.GET.get("dry_run") == "1"
+    if dry_run:
+        sample = list(product_ids)[:50]
+        return JsonResponse(
+            {
+                "success": True,
+                "location_id": location_id,
+                "product_count": len(product_ids),
+                "sample_product_ids": sample,
+                "dry_run": True,
+            }
+        )
+
+    attempted_shopify = 0
+    shopify_deleted = 0
+    errors = []
+    for pid in product_ids:
+        attempted_shopify += 1
+        try:
+            url = f"https://{settings.SHOPIFY_STORE_URL}/admin/api/2025-07/products/{pid}.json"
+            r = services.shopify_request("DELETE", url, timeout=30)
+            if r.status_code in (200, 202, 204) or r.status_code == 404:
+                shopify_deleted += 1
+            else:
+                errors.append(
+                    {"product_id": pid, "status": r.status_code, "body": r.text[:1000]}
+                )
+        except Exception as e:
+            logger.exception("Failed to delete product id %s from Shopify", pid)
+            errors.append({"product_id": pid, "error": str(e)})
+
+    return JsonResponse(
+        {
+            "success": True,
+            "location_id": location_id,
+            "product_count": len(product_ids),
+            "attempted_shopify_deletes": attempted_shopify,
+            "shopify_deleted": shopify_deleted,
+            "errors": errors,
+        }
+    )
+
+
+@csrf_exempt
+def api_delete_all_local(request):
+    """Delete all StyliaProduct rows and their Variant mappings from the local DB only (no Shopify calls)."""
     if request.method != "POST":
         return JsonResponse({"success": False, "error": "POST required"}, status=405)
 
     from .models import Variant
 
-    # Materialize product list to avoid cursor invalidation during deletes
-    products = list(StyliaProduct.objects.values("id", "shopify_id", "model_code"))
-    attempted_shopify = 0
-    shopify_deleted = 0
+    products = list(StyliaProduct.objects.values("id", "model_code"))
     db_deleted = 0
     errors = []
     for row in products:
         pk = row.get("id")
-        shopify_id = row.get("shopify_id")
         model_code = row.get("model_code")
-        if shopify_id:
-            attempted_shopify += 1
-            try:
-                url = f"https://{settings.SHOPIFY_STORE_URL}/admin/api/2025-07/products/{shopify_id}.json"
-                r = services.shopify_request("DELETE", url, timeout=30)
-                if r.status_code in (200, 202, 204) or r.status_code == 404:
-                    shopify_deleted += 1
-                else:
-                    errors.append(
-                        {
-                            "model_code": model_code,
-                            "status": r.status_code,
-                            "body": r.text[:1000],
-                        }
-                    )
-            except Exception as e:
-                logger.exception("Failed to delete product %s from Shopify", model_code)
-                errors.append({"model_code": model_code, "error": str(e)})
-        # Regardless of Shopify result or missing shopify_id, remove Variant mappings and delete DB row
         try:
             Variant.objects.filter(stylia_product_id=pk).delete()
         except Exception:
@@ -237,12 +294,4 @@ def api_delete_all_pushed(request):
             logger.exception("Failed deleting StyliaProduct %s from DB", model_code)
             errors.append({"model_code": model_code, "error": "db_delete_failed"})
 
-    return JsonResponse(
-        {
-            "success": True,
-            "attempted_shopify_deletes": attempted_shopify,
-            "shopify_deleted": shopify_deleted,
-            "db_deleted": db_deleted,
-            "errors": errors,
-        }
-    )
+    return JsonResponse({"success": True, "db_deleted": db_deleted, "errors": errors})

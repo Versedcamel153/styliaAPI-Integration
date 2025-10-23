@@ -4,7 +4,7 @@
 
 {% block content %}
 <div class="mb-6 flex flex-wrap items-center justify-between gap-4">
-    <div class="grid grid-cols-2 md:grid-cols-5 gap-3">
+    <div class="grid grid-cols-2 md:grid-cols-6 gap-3">
         <div class="bg-white p-4 rounded shadow">
             <div class="text-gray-500 text-sm">Total</div>
             <div class="text-2xl font-semibold">{{ stats.total }}</div>
@@ -21,6 +21,10 @@
             <div class="text-gray-500 text-sm">Failed</div>
             <div class="text-2xl font-semibold text-red-600">{{ stats.failed }}</div>
         </div>
+        <!-- <div class="bg-white p-4 rounded shadow">
+            <div class="text-gray-500 text-sm">Already Existing</div>
+            <div class="text-2xl font-semibold text-purple-600">{{ stats.already_existing }}</div>
+        </div> -->
         <!-- <div class="bg-white p-4 rounded shadow">
             <div class="text-gray-500 text-sm">Deleted</div>
             <div class="text-2xl font-semibold text-gray-600">{{ stats.deleted }}</div>
@@ -49,16 +53,21 @@
         <label for="show" class="text-sm text-gray-700">Show:</label>
         <select id="show" onchange="onFilterChange()"
             class="border select border-gray-300 rounded px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-            <option value="all" {% if show == 'all' %}selected{% endif %}>All</option>
+            <option value="all" {% if show == ' all' %}selected{% endif %}>All</option>
             <option value="pushed" {% if show == 'pushed' %}selected{% endif %}>Pushed</option>
             <option value="pending" {% if show == 'pending' %}selected{% endif %}>Pending</option>
             <option value="failed" {% if show == 'failed' %}selected{% endif %}>Failed</option>
             <option value="deleted" {% if show == 'deleted' %}selected{% endif %}>Deleted</option>
+            <option value="existing" {% if show == 'existing' %}selected{% endif %}>Already Existing</option>
         </select>
         <button onclick="triggerSync()" class="bg-blue-600 hover:bg-blue-700 text-white rounded px-4 py-2">Run Sync
             Now</button>
-        <button onclick="deleteAllPushed()"
-            class="ml-2 bg-red-600 hover:bg-red-700 text-white rounded px-4 py-2 text-sm">Delete All Pushed</button>
+        <!-- <button onclick="deleteAllShopify()"
+            class="ml-2 bg-red-600 hover:bg-red-700 text-white rounded px-4 py-2 text-sm">Delete Shopify
+            Products</button>
+        <button onclick="deleteAllLocal()"
+            class="ml-2 bg-orange-600 hover:bg-orange-700 text-white rounded px-4 py-2 text-sm">Delete Local DB
+            Only</button> -->
         <!-- {% if shopify_store_url %}
         <a href="/shopify/install/?shop={{ shopify_store_url }}"
             class="ml-2 bg-gray-700 hover:bg-gray-800 text-white rounded px-3 py-2 text-sm">Install / Reinstall Shopify
@@ -202,13 +211,29 @@
         }
     }
 
-    async function deleteAllPushed() {
-        if (!confirm('Delete ALL pushed products from Shopify and the local DB? This is irreversible.')) return;
+    async function deleteAllShopify() {
+        if (!confirm('Delete ALL pushed products from Shopify? This is irreversible. Local DB will not be cleared.')) return;
         try {
             const res = await fetch('/api/delete-all-pushed/', { method: 'POST' });
             const data = await res.json();
             if (data.success) {
-                alert('Deleted ' + (data.deleted || 0) + ' products.');
+                alert('Attempted ' + (data.attempted_shopify_deletes || 0) + ' deletes. Shopify deleted: ' + (data.shopify_deleted || 0));
+                window.location.reload();
+            } else {
+                alert('Failed: ' + (data.error || JSON.stringify(data.errors || data)));
+            }
+        } catch (e) {
+            alert('Request failed: ' + e.message);
+        }
+    }
+
+    async function deleteAllLocal() {
+        if (!confirm('Delete ALL local Stylia products from the database? This does NOT call Shopify.')) return;
+        try {
+            const res = await fetch('/api/delete-all-local/', { method: 'POST' });
+            const data = await res.json();
+            if (data.success) {
+                alert('Deleted ' + (data.db_deleted || 0) + ' local rows.');
                 window.location.reload();
             } else {
                 alert('Failed: ' + (data.error || JSON.stringify(data.errors || data)));

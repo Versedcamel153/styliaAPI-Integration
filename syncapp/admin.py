@@ -16,7 +16,15 @@ class StyliaProductAdmin(admin.ModelAdmin):
 
 @admin.register(SyncLog)
 class SyncLogAdmin(admin.ModelAdmin):
-    list_display = ("started_at", "completed_at", "success")
+    list_display = (
+        "started_at",
+        "completed_at",
+        "success",
+        "products_created",
+        "products_updated",
+        "products_existing",
+        "products_errors",
+    )
 
 
 @admin.register(ShopifyApp)
