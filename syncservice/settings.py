@@ -88,7 +88,6 @@ DATABASES = {
 #         }
 #     }
 
-
 print("DB SETTINGS:", DATABASES)
 
 AUTH_PASSWORD_VALIDATORS = []
@@ -102,7 +101,7 @@ STATIC_URL = "/static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # Celery
-CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL")
+CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/0")
 CELERY_RESULT_BACKEND = CELERY_BROKER_URL
 
 # Partner and Store credentials (from existing project constants)
@@ -135,17 +134,24 @@ print("Username", STYLIA_USERNAME)
 # Shopify rate control defaults
 # Minimum sleep between Shopify API calls (seconds)
 SYNCLOG_TTL_SECONDS = 900  # 15 minutes
-SHOPIFY_MIN_SLEEP = float(os.environ.get("SHOPIFY_MIN_SLEEP", "0.8"))
+SHOPIFY_MIN_SLEEP = float(os.environ.get("SHOPIFY_MIN_SLEEP", "1.0"))
+# Minimum interval between ANY Shopify API request (enforced by rate limiter)
+# This is the PRIMARY rate limit control - sleep BEFORE every request
+SHOPIFY_MIN_REQUEST_INTERVAL = float(
+    os.environ.get("SHOPIFY_MIN_REQUEST_INTERVAL", "0.7")
+)
 # Maximum backoff used by the request wrapper (seconds)
 SHOPIFY_MAX_BACKOFF = float(os.environ.get("SHOPIFY_MAX_BACKOFF", "10"))
 # How many pending products to process per run
 SHOPIFY_BATCH_SIZE = int(os.environ.get("SHOPIFY_BATCH_SIZE", "20"))
+# Delay between processing each product (seconds) - helps avoid rate limits with large batches
+SHOPIFY_PRODUCT_DELAY = float(os.environ.get("SHOPIFY_PRODUCT_DELAY", "2.0"))
 
 # Optional cross-process rate limiter using Redis (tokens per second)
 SHOPIFY_RATE_LIMIT_TOKENS_PER_SEC = float(
-    os.environ.get("SHOPIFY_RATE_LIMIT_TOKENS_PER_SEC", "2")
+    os.environ.get("SHOPIFY_RATE_LIMIT_TOKENS_PER_SEC", "1.5")
 )
-SHOPIFY_RATE_LIMIT_CAPACITY = int(os.environ.get("SHOPIFY_RATE_LIMIT_CAPACITY", "4"))
+SHOPIFY_RATE_LIMIT_CAPACITY = int(os.environ.get("SHOPIFY_RATE_LIMIT_CAPACITY", "20"))
 # Use explicit URL if provided, else try Celery broker URL
 SHOPIFY_RATE_LIMIT_REDIS_URL = os.environ.get(
     "SHOPIFY_RATE_LIMIT_REDIS_URL", os.environ.get("CELERY_BROKER_URL", "")

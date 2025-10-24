@@ -4,6 +4,7 @@ from . import views
 urlpatterns = [
     path("", views.dashboard, name="sync_dashboard"),
     path("api/trigger-sync/", views.api_trigger_sync, name="api_trigger_sync"),
+    path("api/retry-pending/", views.api_retry_pending, name="api_retry_pending"),
     path(
         "api/products/<int:pk>/reenable/",
         views.api_reenable_product,

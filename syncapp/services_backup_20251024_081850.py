@@ -31,48 +31,32 @@ def _get_redis_client():
 
 
 def _acquire_shopify_rate_token():
-    """Enforce strict rate limiting to prevent 429 errors.
+    """Simple cross-process rate limit: allow N tokens per second with capacity C using Redis.
 
-    Uses a token bucket algorithm with MANDATORY sleep to ensure we never
-    exceed Shopify's rate limits, even with concurrent workers.
-
-    - Shopify allows 2 requests/second (Standard) or 4 requests/second (Plus)
-    - We use a conservative approach: sleep BEFORE every request
-    - Minimum 0.6 seconds between requests (guarantees < 2 req/sec)
+    If Redis or config isn't available, no-op (fall back to per-call sleep and backoff).
     """
-    # ALWAYS sleep before making a request - this is the key fix
-    min_request_interval = getattr(settings, "SHOPIFY_MIN_REQUEST_INTERVAL", 0.6)
-
     client = _get_redis_client()
-    if client:
-        # Use Redis to coordinate across multiple workers
-        key = "shopify:last_request_time"
-        try:
-            # Get last request time
-            last_request = client.get(key)
-            now = time.time()
+    if not client:
+        return
+    key = "shopify:rate:bucket"
+    now_ms = int(time.time() * 1000)
+    window_ms = 1000
+    tokens_per_sec = float(getattr(settings, "SHOPIFY_RATE_LIMIT_TOKENS_PER_SEC", 2.0))
+    capacity = int(getattr(settings, "SHOPIFY_RATE_LIMIT_CAPACITY", 4))
 
-            if last_request:
-                last_time = float(last_request)
-                elapsed = now - last_time
-
-                # If not enough time has passed, sleep the difference
-                if elapsed < min_request_interval:
-                    sleep_time = min_request_interval - elapsed
-                    logger.debug(f"Rate limiter: sleeping {sleep_time:.2f}s")
-                    time.sleep(sleep_time)
-                    now = time.time()  # Update time after sleep
-
-            # Record this request time
-            client.set(key, str(now), ex=2)  # Expire after 2 seconds
-        except Exception as e:
-            logger.warning(
-                f"Redis rate limiter error: {e}, falling back to local sleep"
-            )
-            time.sleep(min_request_interval)
-    else:
-        # No Redis - just sleep locally (won't coordinate across workers but still helps)
-        time.sleep(min_request_interval)
+    # Use a simple counter with 1s TTL. If we exceed capacity, sleep until next second.
+    try:
+        pipe = client.pipeline(True)
+        pipe.incr(key)
+        pipe.expire(key, 1)
+        count, _ = pipe.execute()
+        if int(count) > capacity:
+            # sleep until end of window; cap at small delay
+            time_to_sleep = max(0.0, (window_ms - (now_ms % window_ms)) / 1000.0)
+            time.sleep(min(time_to_sleep, 1.0))
+    except Exception:
+        # ignore limiter failures
+        pass
 
 
 def _build_shopify_urls(product_id: str | int | None, handle: str | None):
@@ -277,11 +261,10 @@ def shopify_headers():
     return {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
 
 
-def shopify_request(method, url, max_retries=10, backoff_base=1.0, **kwargs):
+def shopify_request(method, url, max_retries=5, backoff_base=0.5, **kwargs):
     """Make a resilient request to Shopify with retries and backoff.
 
     Respects Retry-After header and X-Shopify-Shop-Api-Call-Limit to avoid bursting.
-    Increased max_retries to 10 and backoff_base to 1.0 to be more patient with 429 errors.
     """
     attempt = 0
     while True:
@@ -353,18 +336,8 @@ def shopify_request(method, url, max_retries=10, backoff_base=1.0, **kwargs):
                 except Exception:
                     sleep_for = backoff_base * (2 ** (attempt - 1))
             else:
-                # For 429 specifically, use longer backoff
-                if r.status_code == 429:
-                    sleep_for = backoff_base * (2**attempt) + random.random() * 1.0
-                else:
-                    sleep_for = (
-                        backoff_base * (2 ** (attempt - 1)) + random.random() * 0.5
-                    )
-
-            # Cap maximum sleep at 60 seconds to avoid hanging forever
-            sleep_for = min(sleep_for, 60.0)
-
-            logger.warning(
+                sleep_for = backoff_base * (2 ** (attempt - 1)) + random.random() * 0.5
+            logger.info(
                 "Shopify returned %s. Backing off %.2fs (attempt %s/%s)",
                 r.status_code,
                 sleep_for,
@@ -576,49 +549,134 @@ def _sanitize_update_payload(payload: dict) -> dict:
         return payload
 
 
-def _prepare_variant_payload_for_update(existing_product_json, local_variants):
+def _strip_mismatched_variant_options_for_update(
+    product_id: str | int, payload: dict
+) -> dict:
+    """Fetch Shopify product to detect supported options and strip option1/2/3
+    from variant updates when they don't match the product's option count.
+
+    This prevents 422 errors like "Option values provided for X unknown option(s)" when
+    we're only updating price/sku/inventory and not changing options.
     """
-    Prepare variant payload for update by:
-    1. Matching existing variants by SKU to get their IDs
-    2. Stripping option fields that don't match the product's option schema
+    try:
+        r = shopify_get_product(product_id)
+        if r.status_code != 200:
+            return payload
+        prod = (r.json() or {}).get("product") or {}
+        options = prod.get("options") or []
+        option_count = len(options)
+        p = payload.get("product") or {}
+        vs = p.get("variants") or []
+        for v in vs:
+            # Remove option fields beyond what Shopify product actually supports
+            if option_count < 3:
+                v.pop("option3", None)
+            if option_count < 2:
+                v.pop("option2", None)
+            if option_count < 1:
+                v.pop("option1", None)
+        p["variants"] = vs
+        payload["product"] = p
+        return payload
+    except Exception:
+        # On any failure, return original payload unchanged
+        return payload
 
-    This prevents:
-    - "variant already exists" errors (by including existing IDs)
-    - "Option values provided for X unknown option(s)" errors (by stripping mismatched options)
+
+def _merge_into_existing_product(
+    existing_sp, source_sp, found_product_json, location_id_cache=None
+):
+    """Merge source_sp shopify_data into existing_sp and update Shopify.
+
+    - Adds any variants from source_sp that are not present in existing_sp (by SKU).
+    - Updates counts and shopify_data on existing_sp.
+    - Calls shopify_update for the combined product and assigns inventory.
+    - Persists Variant mappings from the updated Shopify response.
+    - Deletes the source_sp record after merge.
     """
-    existing_variants = existing_product_json.get("variants", [])
-    options = existing_product_json.get("options", [])
-    option_count = len(options)
+    try:
+        existing_data = existing_sp.shopify_data or {"product": {"variants": []}}
+        source_data = source_sp.shopify_data or {"product": {"variants": []}}
+        existing_variants = existing_data["product"].get("variants") or []
+        existing_skus = {v.get("sku") for v in existing_variants if v.get("sku")}
 
-    # Build SKU to variant ID map
-    sku_to_id = {}
-    for v in existing_variants:
-        if v.get("sku"):
-            sku_to_id[v["sku"]] = v["id"]
+        # Add missing variants from source
+        added = 0
+        for v in source_data["product"].get("variants") or []:
+            sku = v.get("sku")
+            if not sku or sku in existing_skus:
+                continue
+            existing_variants.append(v)
+            existing_skus.add(sku)
+            added += 1
 
-    prepared_variants = []
-    for local_var in local_variants:
-        sku = local_var.get("sku")
-        variant = dict(local_var)
+        # Update metadata
+        existing_data["product"]["variants"] = existing_variants
+        existing_sp.shopify_data = existing_data
+        existing_sp.variant_count = len(existing_variants)
+        existing_sp.total_stock = sum(
+            int(v.get("inventory_quantity", 0)) for v in existing_variants
+        )
+        existing_sp.save()
 
-        # Match to existing variant by SKU to get the ID
-        if sku and sku in sku_to_id:
-            variant["id"] = sku_to_id[sku]
+        # Enrich ids, dedupe options, then normalize just before update
+        enriched_product = _enrich_variant_ids(existing_sp, existing_data["product"])
+        deduped_product = _dedupe_variants_by_options(enriched_product)
+        payload = _normalize_shopify_payload({"product": deduped_product})
+        # Strip mismatched option fields before update to avoid 422 unknown option(s)
+        payload = _strip_mismatched_variant_options_for_update(
+            existing_sp.shopify_id, payload
+        )
+        updated_payload = shopify_update(
+            existing_sp.shopify_id, _sanitize_update_payload(payload)
+        )
+        # assign inventory for updated product
+        _assign_inventory_to_location(
+            updated_payload.get("product"), location_id_cache, existing_sp
+        )
 
-        # Strip option fields beyond what product supports
-        if option_count < 3:
-            variant.pop("option3", None)
-        if option_count < 2:
-            variant.pop("option2", None)
-        if option_count < 1:
-            variant.pop("option1", None)
+        # persist variant mappings
+        try:
+            from .models import Variant
 
-        # Remove read-only fields
-        variant.pop("inventory_item_id", None)
+            prod = updated_payload.get("product") or {}
+            for v in prod.get("variants") or []:
+                sku_val = v.get("sku")
+                if not sku_val:
+                    continue
+                Variant.objects.update_or_create(
+                    stylia_product=existing_sp,
+                    sku=sku_val,
+                    defaults={
+                        "shopify_variant_id": v.get("id"),
+                        "inventory_item_id": v.get("inventory_item_id"),
+                        "shopify_product_id": prod.get("id"),
+                        "price": v.get("price"),
+                    },
+                )
+        except Exception:
+            logger.exception(
+                "Failed to persist variant mappings during merge for %s",
+                existing_sp.model_code,
+            )
 
-        prepared_variants.append(variant)
+        # delete the source record now that we've merged it
+        try:
+            source_sp.delete()
+        except Exception:
+            logger.exception(
+                "Failed to delete source StyliaProduct after merge: %s",
+                source_sp.model_code,
+            )
 
-    return prepared_variants
+        return True
+    except Exception:
+        logger.exception(
+            "Failed merging product %s into %s",
+            source_sp.model_code,
+            existing_sp.model_code,
+        )
+        return False
 
 
 def shopify_find_product_by_sku(sku):
@@ -1206,7 +1264,7 @@ def ingest_stylia():
 
 
 def push_to_shopify():
-    from .models import StyliaProduct, Variant
+    from .models import StyliaProduct
 
     batch_size = getattr(settings, "SHOPIFY_BATCH_SIZE", 20)
     qs = StyliaProduct.objects.filter(sync_status="pending")
@@ -1230,76 +1288,156 @@ def push_to_shopify():
             continue
         try:
             if not p.shopify_id:
-                # OPTIMIZATION: Skip expensive GraphQL searches, just try to create
-                # If product exists, we'll catch the 422 error and handle it
-                # This reduces API calls from 2-3 down to 1 per new product
-
-                # Create new product
-                normalized_payload = _normalize_shopify_payload(p.shopify_data)
+                # Pre-check: try to locate an existing Shopify product by SKUs or model tag/title to avoid duplicate creates
                 try:
-                    created_payload = shopify_create(normalized_payload)
-
-                    p.shopify_id = str(created_payload["product"]["id"])
-                    p.shopify_handle = created_payload["product"].get("handle")
-                    p.save(update_fields=["shopify_id", "shopify_handle"])
-
-                    # Assign inventory at location
-                    _assign_inventory_to_location(
-                        created_payload["product"], location_id_cache, p
-                    )
-                    p.mark_as_synced()
-                    created += 1
-                except RuntimeError as e:
-                    # Check if this is a duplicate product error (422)
-                    if "422" in str(e) and (
-                        "already exists" in str(e).lower()
-                        or "duplicate" in str(e).lower()
-                    ):
-                        logger.info(
-                            "Product %s already exists in Shopify (422 duplicate), searching to link...",
-                            p.model_code,
+                    skus = [
+                        v.get("sku")
+                        for v in p.shopify_data.get("product", {}).get("variants") or []
+                    ]
+                    found, found_sku = shopify_find_product_by_skus(skus)
+                except Exception:
+                    found, found_sku = None, None
+                if not found:
+                    try:
+                        found = shopify_find_product_by_model(
+                            model_code=p.model_code,
+                            brand=p.brand,
+                            title=p.shopify_data.get("product", {}).get("title") or "",
+                            handle=p.shopify_handle,
                         )
-                        # Search for existing product by SKU or model code
-                        try:
-                            found = shopify_find_product_by_sku(p.model_code)
-                            if found:
-                                shopify_id_to_link = str(found.get("id"))
+                    except Exception:
+                        found = None
+                if found:
+                    try:
+                        from .models import StyliaProduct
 
-                                # Check if another StyliaProduct already has this shopify_id
-                                existing_product = (
-                                    StyliaProduct.objects.filter(
-                                        shopify_id=shopify_id_to_link
-                                    )
-                                    .exclude(id=p.id)
-                                    .first()
-                                )
+                        existing_sp = StyliaProduct.objects.filter(
+                            shopify_id=str(found.get("id"))
+                        ).first()
+                        if existing_sp and existing_sp.pk != p.pk:
+                            _merge_into_existing_product(
+                                existing_sp, p, found, location_id_cache
+                            )
+                            updated += 1
+                            continue
+                        else:
+                            p.shopify_id = found.get("id")
+                            p.shopify_handle = found.get("handle") or p.shopify_handle
+                            # persist existing info (urls + snapshot)
+                            sdata = p.shopify_data or {"product": {}}
+                            sdata["existing_product"] = found
+                            urls = _build_shopify_urls(
+                                found.get("id"), found.get("handle")
+                            )
+                            sdata["existing_info"] = {
+                                "id": found.get("id"),
+                                "handle": found.get("handle"),
+                                **urls,
+                            }
+                            p.shopify_data = sdata
+                            p.save(
+                                update_fields=[
+                                    "shopify_id",
+                                    "shopify_handle",
+                                    "shopify_data",
+                                ]
+                            )
+                    except Exception:
+                        logger.exception(
+                            "Failed to persist mapping from pre-check find"
+                        )
+                    # proceed with update path instead of create
+                    try:
+                        upd_prod = p.shopify_data.get("product", {})
+                        upd_prod = _enrich_variant_ids(p, upd_prod)
+                        upd_prod = _dedupe_variants_by_options(upd_prod)
+                        prep_payload = _normalize_shopify_payload({"product": upd_prod})
+                        prep_payload = _strip_mismatched_variant_options_for_update(
+                            p.shopify_id, prep_payload
+                        )
+                        updated_payload = shopify_update(
+                            p.shopify_id,
+                            _sanitize_update_payload(prep_payload),
+                        )
+                        _assign_inventory_to_location(
+                            updated_payload.get("product"), location_id_cache, p
+                        )
+                        p.mark_as_synced()
+                        updated += 1
+                        existing += 1
+                        # reduce backoff and sleep
+                        error_backoff = max(0, error_backoff - 0.3)
+                        sleep_for = per_call_sleep + error_backoff
+                        if sleep_for:
+                            time.sleep(sleep_for)
+                        continue
+                    except Exception:
+                        logger.exception(
+                            "Pre-check update path failed; will attempt create"
+                        )
+                try:
+                    # normalize payload variants before sending
+                    normalized_payload = _normalize_shopify_payload(p.shopify_data)
+                    created_payload = shopify_create(normalized_payload)
+                except RuntimeError as e:
+                    text = str(e)
+                    # Handle duplicate variant / SKU errors by finding existing product and updating
+                    if "variant" in text.lower() and "already exists" in text.lower():
+                        # attempt to find by any SKU from our shopify_data (all variants)
+                        skus = [
+                            v.get("sku")
+                            for v in p.shopify_data.get("product", {}).get("variants")
+                            or []
+                        ]
+                        found, found_sku = shopify_find_product_by_skus(skus)
+                        if found:
+                            logger.info(
+                                "Found existing product for SKU %s (id=%s) — mapping locally and assigning inventory (no update).",
+                                found_sku,
+                                found.get("id"),
+                            )
+                            # persist mapping to DB and optionally merge duplicates
+                            try:
+                                from .models import StyliaProduct, Variant
 
-                                if existing_product:
-                                    logger.warning(
-                                        "Product %s: Shopify product %s is already linked to %s (id=%s). Skipping duplicate.",
+                                existing_sp = StyliaProduct.objects.filter(
+                                    shopify_id=str(found.get("id"))
+                                ).first()
+                                if existing_sp and existing_sp.pk != p.pk:
+                                    logger.info(
+                                        "Merging %s into %s for shopify_id=%s",
                                         p.model_code,
-                                        shopify_id_to_link,
-                                        existing_product.model_code,
-                                        existing_product.id,
+                                        existing_sp.model_code,
+                                        found.get("id"),
                                     )
-                                    # Mark as error or skip
-                                    p.sync_status = "error"
-                                    p.save(update_fields=["sync_status"])
-                                    errors += 1
+                                    _merge_into_existing_product(
+                                        existing_sp, p, found, location_id_cache
+                                    )
+                                    updated += 1
                                     continue
-
-                                p.shopify_id = shopify_id_to_link
-                                p.shopify_handle = found.get("handle")
-                                p.sync_status = "active"  # Set to active, not synced
+                                p.shopify_id = found.get("id")
+                                p.shopify_handle = (
+                                    found.get("handle") or p.shopify_handle
+                                )
+                                # persist existing info (urls + snapshot)
+                                sdata = p.shopify_data or {"product": {}}
+                                sdata["existing_product"] = found
+                                urls = _build_shopify_urls(
+                                    found.get("id"), found.get("handle")
+                                )
+                                sdata["existing_info"] = {
+                                    "id": found.get("id"),
+                                    "handle": found.get("handle"),
+                                    **urls,
+                                }
+                                p.shopify_data = sdata
                                 p.save(
                                     update_fields=[
                                         "shopify_id",
                                         "shopify_handle",
-                                        "sync_status",
+                                        "shopify_data",
                                     ]
                                 )
-
-                                # Persist variant mappings
                                 for v in found.get("variants") or []:
                                     sku_val = v.get("sku")
                                     if not sku_val:
@@ -1315,64 +1453,225 @@ def push_to_shopify():
                                             "shopify_product_id": found.get("id"),
                                         },
                                     )
-                                logger.info(
-                                    "Successfully linked duplicate product %s to existing Shopify product %s",
-                                    p.model_code,
-                                    p.shopify_id,
+                            except Exception:
+                                logger.exception(
+                                    "Failed to persist mapping for found product"
                                 )
-                                existing += 1
-                                continue
-                        except Exception as search_err:
-                            logger.exception(
-                                "Failed to find/link duplicate product %s: %s",
-                                p.model_code,
-                                search_err,
-                            )
-                    # Re-raise if not a duplicate error or if linking failed
+
+                            # assign inventory at location based on local quantities
+                            try:
+                                sku_qty = {}
+                                for v in (
+                                    p.shopify_data.get("product", {}).get("variants")
+                                    or []
+                                ):
+                                    s = v.get("sku")
+                                    if s:
+                                        sku_qty[s] = int(v.get("inventory_quantity", 0))
+                                if location_id_cache:
+                                    for fv in found.get("variants") or []:
+                                        s = fv.get("sku")
+                                        inv_id = fv.get("inventory_item_id")
+                                        if s and inv_id and s in sku_qty:
+                                            try:
+                                                inventory_connect(
+                                                    inv_id, location_id_cache
+                                                )
+                                                inventory_set(
+                                                    inv_id,
+                                                    location_id_cache,
+                                                    sku_qty[s],
+                                                )
+                                            except Exception:
+                                                logger.exception(
+                                                    "Failed inventory set for sku=%s (inventory_item_id=%s)",
+                                                    s,
+                                                    inv_id,
+                                                )
+                            except Exception:
+                                logger.exception(
+                                    "Inventory assignment after found product failed"
+                                )
+                            # Update location flags after manual assignment
+                            try:
+                                p.location_assigned = True
+                                p.location_last_error = ""
+                                p.save(
+                                    update_fields=[
+                                        "location_assigned",
+                                        "location_last_error",
+                                    ]
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Failed to set location flags after mapping existing product"
+                                )
+                            p.mark_as_synced()
+                            updated += 1
+                            existing += 1
+                            continue
+                    # if not handled by fallback, re-raise
                     raise
-            else:
-                # Update existing product
-                # Fetch current product to prepare payload with option stripping
-                r = shopify_get_product(p.shopify_id)
-                if r.status_code == 404:
-                    logger.warning(
-                        "Product %s not found in Shopify, marking for recreation",
-                        p.model_code,
+                # created successfully — ensure the returned shopify_id isn't already linked to another record
+                created_shopify_id = created_payload["product"]["id"]
+                from .models import StyliaProduct
+
+                existing_sp = (
+                    StyliaProduct.objects.filter(shopify_id=str(created_shopify_id))
+                    .exclude(pk=p.pk)
+                    .first()
+                )
+                if existing_sp:
+                    logger.info(
+                        "Created product id %s is already linked to StyliaProduct %s — merging new data into it.",
+                        created_shopify_id,
+                        existing_sp.model_code,
                     )
-                    p.shopify_id = ""
-                    p.shopify_handle = ""
-                    p.sync_status = "pending"
-                    p.save(
-                        update_fields=["shopify_id", "shopify_handle", "sync_status"]
+                    # Merge p into existing_sp and then continue
+                    _merge_into_existing_product(
+                        existing_sp, p, created_payload, location_id_cache
                     )
+                    updated += 1
                     continue
 
-                if r.status_code != 200:
-                    raise RuntimeError(
-                        f"Failed to fetch product for update: {r.status_code} - {r.text}"
-                    )
-
-                existing_product = r.json().get("product", {})
-                local_variants = p.shopify_data.get("product", {}).get("variants", [])
-
-                # Prepare variants with option stripping and ID matching
-                prepared_variants = _prepare_variant_payload_for_update(
-                    existing_product, local_variants
-                )
-
-                update_payload = {
-                    "product": {
-                        "id": p.shopify_id,
-                        "variants": prepared_variants,
-                    }
-                }
-
-                updated_payload = shopify_update(p.shopify_id, update_payload)
+                p.shopify_id = created_shopify_id
+                p.shopify_handle = created_payload["product"].get("handle")
+                # After create, try to set inventory at location
                 _assign_inventory_to_location(
-                    updated_payload.get("product"), location_id_cache, p
+                    created_payload["product"], location_id_cache, p
                 )
                 p.mark_as_synced()
-                updated += 1
+                created += 1
+            else:
+                upd_prod3 = p.shopify_data.get("product", {})
+                upd_prod3 = _enrich_variant_ids(p, upd_prod3)
+                upd_prod3 = _dedupe_variants_by_options(upd_prod3)
+                try:
+                    prep_payload2 = _normalize_shopify_payload({"product": upd_prod3})
+                    prep_payload2 = _strip_mismatched_variant_options_for_update(
+                        p.shopify_id, prep_payload2
+                    )
+                    updated_payload = shopify_update(
+                        p.shopify_id,
+                        _sanitize_update_payload(prep_payload2),
+                    )
+                    _assign_inventory_to_location(
+                        updated_payload.get("product"), location_id_cache, p
+                    )
+                    p.mark_as_synced()
+                    updated += 1
+                except RuntimeError as e:
+                    text = str(e)
+                    # If Shopify says the variant already exists on update, treat as 'already existing'
+                    if "variant" in text.lower() and "already exists" in text.lower():
+                        try:
+                            # Fetch the current Shopify product and persist mapping + existing_info
+                            r = shopify_get_product(p.shopify_id)
+                            prod_json = {}
+                            try:
+                                prod_json = (
+                                    r.json().get("product", {})
+                                    if r.status_code == 200
+                                    else {}
+                                )
+                            except Exception:
+                                prod_json = {}
+                            sdata = p.shopify_data or {"product": {}}
+                            sdata["existing_product"] = (
+                                prod_json or sdata.get("existing_product") or {}
+                            )
+                            urls = _build_shopify_urls(p.shopify_id, p.shopify_handle)
+                            sdata["existing_info"] = {
+                                "id": p.shopify_id,
+                                "handle": p.shopify_handle,
+                                **urls,
+                            }
+                            p.shopify_data = sdata
+                            p.save(update_fields=["shopify_data"])
+
+                            # Persist Variant mappings from Shopify snapshot if available
+                            try:
+                                from .models import Variant
+
+                                for v in prod_json.get("variants") or []:
+                                    sku_val = v.get("sku")
+                                    if not sku_val:
+                                        continue
+                                    Variant.objects.update_or_create(
+                                        stylia_product=p,
+                                        sku=sku_val,
+                                        defaults={
+                                            "shopify_variant_id": v.get("id"),
+                                            "inventory_item_id": v.get(
+                                                "inventory_item_id"
+                                            ),
+                                            "shopify_product_id": p.shopify_id,
+                                        },
+                                    )
+                            except Exception:
+                                logger.exception(
+                                    "Failed to persist variant mapping after 422 on update"
+                                )
+
+                            # Assign inventory at configured location using local quantities
+                            try:
+                                sku_qty = {}
+                                for v in (
+                                    p.shopify_data.get("product", {}).get("variants")
+                                    or []
+                                ):
+                                    s = v.get("sku")
+                                    if s:
+                                        sku_qty[s] = int(v.get("inventory_quantity", 0))
+                                if location_id_cache and prod_json:
+                                    for fv in prod_json.get("variants") or []:
+                                        s = fv.get("sku")
+                                        inv_id = fv.get("inventory_item_id")
+                                        if s and inv_id and s in sku_qty:
+                                            try:
+                                                inventory_connect(
+                                                    inv_id, location_id_cache
+                                                )
+                                                inventory_set(
+                                                    inv_id,
+                                                    location_id_cache,
+                                                    sku_qty[s],
+                                                )
+                                            except Exception:
+                                                logger.exception(
+                                                    "Failed inventory set for sku=%s (inventory_item_id=%s)",
+                                                    s,
+                                                    inv_id,
+                                                )
+                            except Exception:
+                                logger.exception(
+                                    "Inventory assignment after 422 on update failed"
+                                )
+                            # Update location flags after manual assignment
+                            try:
+                                p.location_assigned = True
+                                p.location_last_error = ""
+                                p.save(
+                                    update_fields=[
+                                        "location_assigned",
+                                        "location_last_error",
+                                    ]
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Failed to set location flags after 422 on update"
+                                )
+                            p.mark_as_synced()
+                            updated += 1
+                            existing += 1
+                            # continue to next product
+                            pass
+                        except Exception:
+                            # fall back to raising the original error if our handling fails
+                            raise
+                    else:
+                        # re-raise non-duplicate errors
+                        raise
             # on success, gently reduce backoff and sleep to avoid bursts
             error_backoff = max(0, error_backoff - 0.3)
             sleep_for = per_call_sleep + error_backoff
@@ -1414,37 +1713,20 @@ def process_creations():
     and inventory assignment logic.
     """
     from .models import StyliaProduct
-    import time
 
     batch_size = getattr(settings, "SHOPIFY_BATCH_SIZE", 20)
-    product_delay = getattr(settings, "SHOPIFY_PRODUCT_DELAY", 1.5)
-
     qs = (
         StyliaProduct.objects.filter(sync_status="pending")
         .filter(shopify_id__isnull=True)
         .order_by("updated_at")[:batch_size]
     )
     created = updated = existing = errors = 0
-    processed_count = 0
-
     for p in qs:
         res = push_single_product(p.pk)
         created += res["summary"]["created"]
         updated += res["summary"]["updated"]
         existing += res["summary"].get("existing", 0)
         errors += res["summary"]["errors"]
-
-        processed_count += 1
-        # Add delay between products to avoid rate limits (except after last product)
-        if processed_count < len(qs) and product_delay > 0:
-            logger.info(
-                "Sleeping %.2fs before next product (processed %d/%d)",
-                product_delay,
-                processed_count,
-                len(qs),
-            )
-            time.sleep(product_delay)
-
     return {
         "success": True,
         "summary": {
@@ -1459,11 +1741,8 @@ def process_creations():
 def process_updates():
     """Process only updates: records staged with sync_status='updated' and an existing shopify_id."""
     from .models import StyliaProduct
-    import time
 
     batch_size = getattr(settings, "SHOPIFY_BATCH_SIZE", 20)
-    product_delay = getattr(settings, "SHOPIFY_PRODUCT_DELAY", 1.5)
-
     qs = (
         StyliaProduct.objects.filter(sync_status="updated")
         .exclude(shopify_id__isnull=True)
@@ -1471,92 +1750,14 @@ def process_updates():
         .order_by("updated_at")[:batch_size]
     )
     created = updated = existing = errors = 0
-    processed_count = 0
-    total_count = qs.count()
-
     for p in qs.iterator():
         res = push_single_product(p.pk)
         created += res["summary"]["created"]
         updated += res["summary"]["updated"]
         existing += res["summary"].get("existing", 0)
         errors += res["summary"]["errors"]
-
-        processed_count += 1
-        # Add delay between products to avoid rate limits (except after last product)
-        if processed_count < total_count and product_delay > 0:
-            logger.info(
-                "Sleeping %.2fs before next product (processed %d/%d)",
-                product_delay,
-                processed_count,
-                total_count,
-            )
-            time.sleep(product_delay)
-
     return {
         "success": True,
-        "summary": {
-            "created": created,
-            "updated": updated,
-            "existing": existing,
-            "errors": errors,
-        },
-    }
-
-
-def retry_pending_products():
-    """Retry products stuck in 'pending' status that haven't been processed.
-
-    This is useful for products that failed during sync due to temporary issues
-    like network errors, rate limits, or transient Shopify API problems.
-    """
-    from .models import StyliaProduct
-    from django.utils import timezone
-    from datetime import timedelta
-    import time
-
-    # Retry products that have been pending for more than 5 minutes
-    retry_threshold = timezone.now() - timedelta(minutes=5)
-    batch_size = getattr(settings, "SHOPIFY_BATCH_SIZE", 20)
-    product_delay = getattr(settings, "SHOPIFY_PRODUCT_DELAY", 1.5)
-
-    qs = (
-        StyliaProduct.objects.filter(sync_status="pending")
-        .filter(updated_at__lt=retry_threshold)
-        .order_by("updated_at")[:batch_size]
-    )
-
-    created = updated = existing = errors = 0
-    retried_count = 0
-    total_count = qs.count()
-
-    for p in qs:
-        logger.info(
-            "Retrying stuck pending product: %s (last updated: %s)",
-            p.model_code,
-            p.updated_at,
-        )
-        res = push_single_product(p.pk)
-        retried_count += 1
-        created += res.get("summary", {}).get("created", 0)
-        updated += res.get("summary", {}).get("updated", 0)
-        existing += res.get("summary", {}).get("existing", 0)
-        errors += res.get("summary", {}).get("errors", 0)
-
-        # Add delay between products to avoid rate limits (except after last product)
-        if retried_count < total_count and product_delay > 0:
-            logger.info(
-                "Sleeping %.2fs before next product (processed %d/%d)",
-                product_delay,
-                retried_count,
-                total_count,
-            )
-            time.sleep(product_delay)
-
-    logger.info("Retry pending products: processed %d products", retried_count)
-
-    return {
-        "success": True,
-        "retried": retried_count,
         "summary": {
             "created": created,
             "updated": updated,
@@ -1570,34 +1771,26 @@ def push_single_product(product_id):
     """Push a single product by id (create or update) and return result dict.
     This is intended to be called from a task to avoid scheduling a full sync.
     """
-    from .models import StyliaProduct, Variant
+    from .models import StyliaProduct
 
     try:
         p = StyliaProduct.objects.get(pk=product_id)
     except StyliaProduct.DoesNotExist:
-        return {
-            "success": False,
-            "error": "not_found",
-            "summary": {"created": 0, "updated": 0, "existing": 0, "errors": 1},
-        }
+        return {"success": False, "error": "not_found"}
 
     location_id_cache = resolve_location_id()
     created = updated = existing = errors = 0
     # prevent concurrent update for same model code
     if not _acquire_product_lock(p.model_code):
-        return {
-            "success": False,
-            "error": "locked",
-            "summary": {"created": 0, "updated": 0, "existing": 0, "errors": 0},
-        }
+        return {"success": False, "error": "locked"}
     try:
         if not p.shopify_id:
-            # Create new product
             try:
+                # normalize payload before create
                 created_payload = shopify_create(
                     _normalize_shopify_payload(p.shopify_data)
                 )
-                p.shopify_id = str(created_payload["product"]["id"])
+                p.shopify_id = created_payload["product"]["id"]
                 p.shopify_handle = created_payload["product"].get("handle")
                 _assign_inventory_to_location(
                     created_payload["product"], location_id_cache, p
@@ -1605,63 +1798,173 @@ def push_single_product(product_id):
                 p.mark_as_synced()
                 created = 1
             except RuntimeError as e:
-                # Check if this is a duplicate product error (422)
-                if "422" in str(e) and (
-                    "already exists" in str(e).lower() or "duplicate" in str(e).lower()
-                ):
-                    logger.info(
-                        "Product %s already exists in Shopify (422 duplicate), searching to link...",
-                        p.model_code,
-                    )
-                    # Search for existing product by SKU or model code
-                    try:
-                        found = shopify_find_product_by_sku(p.model_code)
-                        if found:
-                            shopify_id_to_link = str(found.get("id"))
+                text = str(e)
+                if "variant" in text.lower() and "already exists" in text.lower():
+                    skus = [
+                        v.get("sku")
+                        for v in p.shopify_data.get("product", {}).get("variants") or []
+                    ]
+                    found, found_sku = shopify_find_product_by_skus(skus)
+                    if found:
+                        # Found existing product, switch to update
+                        try:
+                            from .models import StyliaProduct
 
-                            # Check if another StyliaProduct already has this shopify_id
-                            existing_product = (
-                                StyliaProduct.objects.filter(
-                                    shopify_id=shopify_id_to_link
+                            existing_sp = StyliaProduct.objects.filter(
+                                shopify_id=str(found.get("id"))
+                            ).first()
+                            if existing_sp and existing_sp.pk != p.pk:
+                                # Merge p into existing_sp (source p will be deleted inside merge)
+                                _merge_into_existing_product(
+                                    existing_sp, p, found, location_id_cache
                                 )
-                                .exclude(id=p.id)
-                                .first()
+                                updated = 1
+                                existing = 1
+                            else:
+                                p.shopify_id = found.get("id")
+                                p.shopify_handle = (
+                                    found.get("handle") or p.shopify_handle
+                                )
+                                # persist existing info (urls + snapshot)
+                                sdata = p.shopify_data or {"product": {}}
+                                sdata["existing_product"] = found
+                                urls = _build_shopify_urls(
+                                    found.get("id"), found.get("handle")
+                                )
+                                sdata["existing_info"] = {
+                                    "id": found.get("id"),
+                                    "handle": found.get("handle"),
+                                    **urls,
+                                }
+                                p.shopify_data = sdata
+                                p.save(
+                                    update_fields=[
+                                        "shopify_id",
+                                        "shopify_handle",
+                                        "shopify_data",
+                                    ]
+                                )
+                                from .models import Variant
+
+                                for v in found.get("variants") or []:
+                                    sku_val = v.get("sku")
+                                    if not sku_val:
+                                        continue
+                                    Variant.objects.update_or_create(
+                                        stylia_product=p,
+                                        sku=sku_val,
+                                        defaults={
+                                            "shopify_variant_id": v.get("id"),
+                                            "inventory_item_id": v.get(
+                                                "inventory_item_id"
+                                            ),
+                                            "shopify_product_id": found.get("id"),
+                                        },
+                                    )
+                        except Exception:
+                            logger.exception(
+                                "Failed to persist variant mapping when switching to update (single push)"
                             )
 
-                            if existing_product:
-                                logger.warning(
-                                    "Product %s: Shopify product %s is already linked to %s (id=%s). Skipping duplicate.",
-                                    p.model_code,
-                                    shopify_id_to_link,
-                                    existing_product.model_code,
-                                    existing_product.id,
-                                )
-                                errors = 1
-                                _release_product_lock(p.model_code)
-                                return {
-                                    "success": False,
-                                    "error": "duplicate_already_linked",
-                                    "summary": {
-                                        "created": 0,
-                                        "updated": 0,
-                                        "existing": 0,
-                                        "errors": 1,
-                                    },
-                                }
-
-                            p.shopify_id = shopify_id_to_link
-                            p.shopify_handle = found.get("handle")
-                            p.sync_status = "active"  # Set to active, not synced
+                        # Don't update the product to avoid duplicate errors; assign inventory only
+                        try:
+                            sku_qty = {}
+                            for v in (
+                                p.shopify_data.get("product", {}).get("variants") or []
+                            ):
+                                s = v.get("sku")
+                                if s:
+                                    sku_qty[s] = int(v.get("inventory_quantity", 0))
+                            if location_id_cache:
+                                for fv in found.get("variants") or []:
+                                    s = fv.get("sku")
+                                    inv_id = fv.get("inventory_item_id")
+                                    if s and inv_id and s in sku_qty:
+                                        try:
+                                            inventory_connect(inv_id, location_id_cache)
+                                            inventory_set(
+                                                inv_id, location_id_cache, sku_qty[s]
+                                            )
+                                        except Exception:
+                                            logger.exception(
+                                                "Failed inventory set for sku=%s (inventory_item_id=%s)",
+                                                s,
+                                                inv_id,
+                                            )
+                        except Exception:
+                            logger.exception(
+                                "Inventory assignment after found product failed (single push)"
+                            )
+                        # Update location flags after manual assignment
+                        try:
+                            p.location_assigned = True
+                            p.location_last_error = ""
                             p.save(
                                 update_fields=[
-                                    "shopify_id",
-                                    "shopify_handle",
-                                    "sync_status",
+                                    "location_assigned",
+                                    "location_last_error",
                                 ]
                             )
+                        except Exception:
+                            logger.exception(
+                                "Failed to set location flags after mapping existing product (single push)"
+                            )
+                        p.mark_as_synced()
+                        updated = 1
+                        existing = 1
+                    else:
+                        raise
+                else:
+                    raise
+        else:
+            sp_prod2 = p.shopify_data.get("product", {})
+            sp_prod2 = _enrich_variant_ids(p, sp_prod2)
+            sp_prod2 = _dedupe_variants_by_options(sp_prod2)
+            try:
+                updated_payload = shopify_update(
+                    p.shopify_id,
+                    _sanitize_update_payload(
+                        _normalize_shopify_payload({"product": sp_prod2})
+                    ),
+                )
+                _assign_inventory_to_location(
+                    updated_payload.get("product"), location_id_cache, p
+                )
+                p.mark_as_synced()
+                updated = 1
+                existing = 1
+            except RuntimeError as e:
+                text = str(e)
+                if "variant" in text.lower() and "already exists" in text.lower():
+                    # Treat as 'already existing' — no update, just map and assign inventory; persist existing_info
+                    try:
+                        r = shopify_get_product(p.shopify_id)
+                        prod_json = {}
+                        try:
+                            prod_json = (
+                                r.json().get("product", {})
+                                if r.status_code == 200
+                                else {}
+                            )
+                        except Exception:
+                            prod_json = {}
+                        sdata = p.shopify_data or {"product": {}}
+                        sdata["existing_product"] = (
+                            prod_json or sdata.get("existing_product") or {}
+                        )
+                        urls = _build_shopify_urls(p.shopify_id, p.shopify_handle)
+                        sdata["existing_info"] = {
+                            "id": p.shopify_id,
+                            "handle": p.shopify_handle,
+                            **urls,
+                        }
+                        p.shopify_data = sdata
+                        p.save(update_fields=["shopify_data"])
 
-                            # Persist variant mappings
-                            for v in found.get("variants") or []:
+                        try:
+                            from .models import Variant
+
+                            for v in prod_json.get("variants") or []:
                                 sku_val = v.get("sku")
                                 if not sku_val:
                                     continue
@@ -1671,82 +1974,63 @@ def push_single_product(product_id):
                                     defaults={
                                         "shopify_variant_id": v.get("id"),
                                         "inventory_item_id": v.get("inventory_item_id"),
-                                        "shopify_product_id": found.get("id"),
+                                        "shopify_product_id": p.shopify_id,
                                     },
                                 )
-                            logger.info(
-                                "Successfully linked duplicate product %s to existing Shopify product %s",
-                                p.model_code,
-                                p.shopify_id,
+                        except Exception:
+                            logger.exception(
+                                "Failed to persist variant mapping after 422 on single update"
                             )
-                            existing = 1
-                        else:
-                            errors = 1
-                            _release_product_lock(p.model_code)
-                            return {
-                                "success": False,
-                                "error": "duplicate_not_found",
-                                "summary": {
-                                    "created": 0,
-                                    "updated": 0,
-                                    "existing": 0,
-                                    "errors": 1,
-                                },
-                            }
-                    except Exception as search_err:
-                        logger.exception(
-                            "Failed to find/link duplicate product %s: %s",
-                            p.model_code,
-                            search_err,
-                        )
-                        _release_product_lock(p.model_code)
-                        return {
-                            "success": False,
-                            "error": str(search_err),
-                            "summary": {
-                                "created": 0,
-                                "updated": 0,
-                                "existing": 0,
-                                "errors": 1,
-                            },
-                        }
+
+                        try:
+                            sku_qty = {}
+                            for v in (
+                                p.shopify_data.get("product", {}).get("variants") or []
+                            ):
+                                s = v.get("sku")
+                                if s:
+                                    sku_qty[s] = int(v.get("inventory_quantity", 0))
+                            if location_id_cache and prod_json:
+                                for fv in prod_json.get("variants") or []:
+                                    s = fv.get("sku")
+                                    inv_id = fv.get("inventory_item_id")
+                                    if s and inv_id and s in sku_qty:
+                                        try:
+                                            inventory_connect(inv_id, location_id_cache)
+                                            inventory_set(
+                                                inv_id, location_id_cache, sku_qty[s]
+                                            )
+                                        except Exception:
+                                            logger.exception(
+                                                "Failed inventory set for sku=%s (inventory_item_id=%s)",
+                                                s,
+                                                inv_id,
+                                            )
+                        except Exception:
+                            logger.exception(
+                                "Inventory assignment after 422 on single update failed"
+                            )
+                        # Update location flags after manual assignment
+                        try:
+                            p.location_assigned = True
+                            p.location_last_error = ""
+                            p.save(
+                                update_fields=[
+                                    "location_assigned",
+                                    "location_last_error",
+                                ]
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to set location flags after 422 on single update"
+                            )
+                        p.mark_as_synced()
+                        updated = 1
+                        existing = 1
+                    except Exception:
+                        raise
                 else:
-                    # Re-raise if not a duplicate error
                     raise
-        else:
-            # Update existing product
-            r = shopify_get_product(p.shopify_id)
-            if r.status_code == 404:
-                p.shopify_id = ""
-                p.sync_status = "pending"
-                p.save(update_fields=["shopify_id", "sync_status"])
-                _release_product_lock(p.model_code)
-                return {
-                    "success": False,
-                    "error": "not_found_in_shopify",
-                    "summary": {"created": 0, "updated": 0, "existing": 0, "errors": 1},
-                }
-
-            if r.status_code != 200:
-                raise RuntimeError(
-                    f"Failed to fetch product: {r.status_code} - {r.text}"
-                )
-
-            existing_product = r.json().get("product", {})
-            local_variants = p.shopify_data.get("product", {}).get("variants", [])
-            prepared_variants = _prepare_variant_payload_for_update(
-                existing_product, local_variants
-            )
-
-            update_payload = {
-                "product": {"id": p.shopify_id, "variants": prepared_variants}
-            }
-            updated_payload = shopify_update(p.shopify_id, update_payload)
-            _assign_inventory_to_location(
-                updated_payload.get("product"), location_id_cache, p
-            )
-            p.mark_as_synced()
-            updated = 1
     except Exception:
         tb = traceback.format_exc()
         logger.exception("Failed pushing single product %s: %s", p.model_code, tb)

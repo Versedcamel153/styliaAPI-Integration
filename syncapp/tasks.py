@@ -9,6 +9,7 @@ from .services import (
     push_to_shopify,
     process_creations,
     process_updates,
+    retry_pending_products,
     ensure_location_assignments,
 )
 from .services import push_single_product
@@ -45,18 +46,26 @@ def run_full_sync():
     log = SyncLog.objects.create(started_at=timezone.now())
     t0 = reconcile_shopify_state()
     t1 = ingest_stylia()
+    # Retry any stuck pending products first (products that failed in previous syncs)
+    retry_res = retry_pending_products()
     # Process creations first, then updates (separate queues)
     c_res = process_creations()
     u_res = process_updates()
     # Ensure inventory is connected and quantities set at the configured location each run
     loc_res = ensure_location_assignments()
-    log.products_created = c_res["summary"]["created"]
-    log.products_updated = u_res["summary"]["updated"]
+    log.products_created = c_res["summary"]["created"] + retry_res["summary"]["created"]
+    log.products_updated = u_res["summary"]["updated"] + retry_res["summary"]["updated"]
     # Persist count of products that already existed in Shopify and were only mapped/linked
-    log.products_existing = c_res["summary"].get("existing", 0) + u_res["summary"].get(
-        "existing", 0
+    log.products_existing = (
+        c_res["summary"].get("existing", 0)
+        + u_res["summary"].get("existing", 0)
+        + retry_res["summary"].get("existing", 0)
     )
-    log.products_errors = c_res["summary"]["errors"] + u_res["summary"]["errors"]
+    log.products_errors = (
+        c_res["summary"]["errors"]
+        + u_res["summary"]["errors"]
+        + retry_res["summary"]["errors"]
+    )
     log.stylia_products_count = t1["summary"]["unique"]
     log.mark_completed(success=True)
 
@@ -64,6 +73,7 @@ def run_full_sync():
         "timestamp": timezone.now().isoformat(),
         "reconcile": t0,
         "ingest": t1,
+        "retry": retry_res,
         "creations": c_res,
         "updates": u_res,
         "location": loc_res,
@@ -83,3 +93,9 @@ def run_process_creations():
 @shared_task
 def run_process_updates():
     return process_updates()
+
+
+@shared_task
+def run_retry_pending():
+    """Manually retry products stuck in pending status."""
+    return retry_pending_products()

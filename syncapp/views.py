@@ -12,6 +12,7 @@ from .models import ShopifyApp
 import requests
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
+from .tasks import run_retry_pending
 
 from . import services
 import logging
@@ -75,6 +76,22 @@ def api_trigger_sync(request):
     # Queue sync asynchronously
     task = run_full_sync.delay()
     return JsonResponse({"success": True, "task_id": task.id})
+
+
+@csrf_exempt
+def api_retry_pending(request):
+    """Manually trigger retry of products stuck in pending status."""
+    if request.method != "POST":
+        return JsonResponse({"success": False, "error": "POST required"}, status=405)
+    # Queue retry task asynchronously
+    task = run_retry_pending.delay()
+    return JsonResponse(
+        {
+            "success": True,
+            "task_id": task.id,
+            "message": "Retrying stuck pending products",
+        }
+    )
 
 
 @csrf_exempt
