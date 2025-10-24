@@ -23,6 +23,7 @@ class StyliaProduct(models.Model):
             ("updated", "Updated"),
             ("failed", "Failed"),
             ("deleted", "Deleted"),
+            ("skipped", "Skipped"),
         ],
         default="pending",
     )

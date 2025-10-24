@@ -1630,13 +1630,16 @@ def push_single_product(product_id):
 
                             if existing_product:
                                 logger.warning(
-                                    "Product %s: Shopify product %s is already linked to %s (id=%s). Skipping duplicate.",
+                                    "Product %s: Shopify product %s is already linked to %s (id=%s). Marking as skipped.",
                                     p.model_code,
                                     shopify_id_to_link,
                                     existing_product.model_code,
                                     existing_product.id,
                                 )
-                                errors = 1
+                                # Mark as skipped so it's not stuck in pending
+                                p.sync_status = "skipped"
+                                p.push_last_error = f"Duplicate of {existing_product.model_code} (already linked to Shopify product {shopify_id_to_link})"
+                                p.save(update_fields=["sync_status", "push_last_error"])
                                 _release_product_lock(p.model_code)
                                 return {
                                     "success": False,
@@ -1741,12 +1744,31 @@ def push_single_product(product_id):
             update_payload = {
                 "product": {"id": p.shopify_id, "variants": prepared_variants}
             }
-            updated_payload = shopify_update(p.shopify_id, update_payload)
-            _assign_inventory_to_location(
-                updated_payload.get("product"), location_id_cache, p
-            )
-            p.mark_as_synced()
-            updated = 1
+            try:
+                updated_payload = shopify_update(p.shopify_id, update_payload)
+                _assign_inventory_to_location(
+                    updated_payload.get("product"), location_id_cache, p
+                )
+                p.mark_as_synced()
+                updated = 1
+            except RuntimeError as update_err:
+                # Handle specific 422 variant errors gracefully
+                if (
+                    "422" in str(update_err)
+                    and "already exists" in str(update_err).lower()
+                ):
+                    logger.warning(
+                        "Product %s: Variant already exists in Shopify. Marking as active without update.",
+                        p.model_code,
+                    )
+                    # Mark as active since the product exists in Shopify even if we can't update it
+                    p.sync_status = "active"
+                    p.push_last_error = f"Variant conflict: {str(update_err)[:500]}"
+                    p.save(update_fields=["sync_status", "push_last_error"])
+                    existing = 1
+                else:
+                    # Re-raise other errors
+                    raise
     except Exception:
         tb = traceback.format_exc()
         logger.exception("Failed pushing single product %s: %s", p.model_code, tb)
